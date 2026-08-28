@@ -37,7 +37,9 @@ or expose local credentials or environment data.
 5. Push Git refs only to the remote named `fork`, which must resolve to
    `vitek-karas/xharness`.
 6. Every push command must explicitly name `fork` and a remote branch beginning
-   with `aw-fixer/`. Never use `git push origin` or an implicit push remote.
+   with `aw-fixer-pr/`. Never use `aw-fixer/`: Git cannot create that namespace
+   while the fork has the control branch `aw-fixer`. Never use `git push origin`
+   or an implicit push remote.
 7. Never push any ref to `dotnet/xharness`.
 8. Never merge, approve, mark ready, force-push, amend reviewed commits, delete
    remote branches, close generated issues, or alter repository settings.
@@ -128,7 +130,7 @@ uncertain, skip it and report the conflict.
 Before reading trusted repository source or preparing any new PR:
 
 1. Derive the sanitized branch
-   `aw-fixer/<workflow-id>-<fingerprint-prefix>`.
+   `aw-fixer-pr/<workflow-id>-<fingerprint-prefix>`.
 2. Run `git worktree list` and fail rather than reuse an existing branch or
    worktree for that name.
 3. Create a sibling PR worktree and its branch directly at the recorded

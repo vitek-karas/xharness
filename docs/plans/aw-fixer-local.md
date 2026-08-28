@@ -449,8 +449,10 @@ app's missed/failed-run status remains the bootstrap signal.
 - Use a fresh worktree and one incident branch per PR.
 - Use `dotnet/xharness` only as the upstream read and primary incident
   PR/discussion target. Watchdog PRs target only `vitek-karas/xharness:aw-fixer`.
-- Push only branches beginning with an aw-fixer-specific prefix, and push them
-  only to `vitek-karas/xharness`.
+- Push primary incident branches only under `aw-fixer-pr/` and watchdog
+  branches only under `aw-fixer-watchdog/`, and push them only to
+  `vitek-karas/xharness`. Do not use `aw-fixer/`; Git cannot create that
+  namespace while the fork has the control branch `aw-fixer`.
 - Never push any branch, tag, or Git ref to `dotnet/xharness`.
 - Never push to `main`, `master`, or `release/*`.
 - Never force-push or delete remote branches.

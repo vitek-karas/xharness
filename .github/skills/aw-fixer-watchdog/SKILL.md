@@ -14,10 +14,11 @@ reason the watchdog can diagnose a broken primary skill.
 
 The watchdog has the same standing publication authorization as the primary:
 at most one draft PR per run, with every Git ref pushed only to
-`vitek-karas/xharness` on an `aw-fixer/` branch. Unlike primary incident PRs,
-watchdog PRs are opened only inside `vitek-karas/xharness` and target its
-`aw-fixer` branch. The watchdog must never push any ref to or open a PR against
-`dotnet/xharness`.
+`vitek-karas/xharness` on an `aw-fixer-watchdog/` branch. Never use
+`aw-fixer/`: Git cannot create that namespace while the fork has the control
+branch `aw-fixer`. Unlike primary incident PRs, watchdog PRs are opened only
+inside `vitek-karas/xharness` and target its `aw-fixer` branch. The watchdog
+must never push any ref to or open a PR against `dotnet/xharness`.
 
 ## Required schedule input
 
@@ -76,7 +77,7 @@ lines across at most three files:
 4. fetch `fork aw-fixer` without changing the control branch and record
    `fork/aw-fixer` as immutable `WATCHDOG_BASE_SHA`;
 5. run `git worktree list`, then create a new sibling PR worktree and branch
-   `aw-fixer/watchdog-<failure-fingerprint>` directly at
+   `aw-fixer-watchdog/<failure-fingerprint>` directly at
    `WATCHDOG_BASE_SHA`; fail rather than reuse an existing branch or worktree;
 6. require the PR worktree's initial `HEAD` to equal `WATCHDOG_BASE_SHA` and
    its status to be clean;
@@ -87,9 +88,9 @@ lines across at most three files:
    diff range `WATCHDOG_BASE_SHA..HEAD` contains only watchdog-fix commits and
    relevant files;
 9. push explicitly from the PR worktree to
-   `fork` as `aw-fixer/watchdog-<failure-fingerprint>`;
+   `fork` as `aw-fixer-watchdog/<failure-fingerprint>`;
 10. open a draft `[aw-fixer]` PR in `vitek-karas/xharness` with base
-    `aw-fixer` and head `aw-fixer/watchdog-<failure-fingerprint>`; and
+    `aw-fixer` and head `aw-fixer-watchdog/<failure-fingerprint>`; and
 11. include the failed local workflow/session evidence, diagnosis, validation,
    and the normal aw-fixer fenced metadata.
 12. Add exactly two PR comments: an **Analysis** comment with evidence,
