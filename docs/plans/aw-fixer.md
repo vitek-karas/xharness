@@ -272,6 +272,9 @@ For each generated issue represented by the incident, add one comment linking
 to the matching open, merged, or newly created PR unless its fenced aw-fixer
 metadata shows that link already exists.
 
+Describe the link as **"PR with a candidate fix"**. Never call it a "draft PR"
+in an issue comment because draft status is temporary.
+
 Do not close generated issues and do not use closing keywords in these links.
 
 ## Special handling for `[aw] Detection Runs`
@@ -293,7 +296,8 @@ Handle it as follows:
 5. Link a PR to both the discovered parent issue and the exact detection comment
    permalink.
 6. Add one backlink comment to the discovered issue per matching PR. The comment
-   names the PR and the specific detection comment(s) it covers.
+   names it as a **"PR with a candidate fix"**, never a "draft PR", and lists
+   the specific detection comment(s) it covers.
 7. Use `Related to #<discovered-number>`, never a closing keyword.
 
 This explicitly supports many PRs linked to the current Detection Runs issue.

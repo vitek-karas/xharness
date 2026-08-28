@@ -255,7 +255,9 @@ Add exactly two PR comments:
    missing information/decision and safe continuation sequence.
 
 For each represented generated issue, add one backlink to the PR unless an
-exact link already exists. Never use closing keywords.
+exact link already exists. Describe the link as **"PR with a candidate fix"**.
+Never call it a "draft PR" in an issue comment because draft status is
+temporary. Never use closing keywords.
 
 If commit, push, PR creation, labeling, or commenting fails, preserve the local
 branch/session and report the failure. Do not report publication success unless
@@ -282,7 +284,8 @@ exact comment permalink. One parent issue may link to many aw-fixer PRs.
 A PR that links only the parent Detection Runs issue is not an exact occurrence
 match. Require the exact comment permalink, linked run, occurrence key, or
 incident fingerprint. A backlink for one occurrence does not cover another;
-include the exact comment permalink and occurrence key in each backlink.
+include the exact comment permalink and occurrence key in each backlink, and
+describe the linked PR as a **"PR with a candidate fix"**, not a "draft PR".
 
 ## Final report
 

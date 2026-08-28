@@ -404,6 +404,9 @@ For every generated issue represented by the incident, add one backlink to the
 matching open, recently merged, or newly created PR unless the issue already
 contains matching aw-fixer metadata.
 
+The issue comment describes the link as **"PR with a candidate fix"**. It never
+calls the linked item a "draft PR" because draft status is temporary.
+
 Do not close, retitle, assign, or rewrite generated issues. Do not use closing
 keywords.
 
@@ -418,7 +421,9 @@ Treat each comment as an occurrence:
 2. Group comments only when the normal incident fingerprint identifies the same
    root cause.
 3. Link each PR to the parent issue and every exact comment it covers.
-4. Add one parent-issue backlink per PR, naming the covered comment permalinks.
+4. Add one parent-issue backlink per PR, naming the covered comment permalinks
+   and describing the link as a **"PR with a candidate fix"**, never a
+   "draft PR".
 5. Use `Related to #<number>`, never a closing keyword.
 
 The parent issue remains an index and may legitimately link to many aw-fixer
