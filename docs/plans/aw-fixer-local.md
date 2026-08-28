@@ -103,16 +103,24 @@ minimal scheduled prompt. A separate custom agent would mostly duplicate the
 skill instructions and tool policy.
 
 Create a local scheduled project workflow in the Copilot app after the skill is
-available on the default branch. Its prompt should remain small:
+available on the branch selected for the automation's control worktree. This
+may be the fork-only `aw-fixer` branch during rollout. Its prompt should remain
+small:
 
 > Use the `/aw-fixer` skill to run one complete scheduled maintenance cycle for
 > `dotnet/xharness`. Operate autonomously according to the skill's publication
 > policy and process the oldest actionable incident first.
 
-Run it in autopilot mode in a fresh XHarness worktree based on `main`. Use a
-custom cron schedule equivalent to every 12 hours and a 24-hour overlapping
-lookback. Keep manual invocation available for recovery scans with a bounded
-lookback of up to seven days.
+Run it in autopilot mode in a fresh, clean XHarness control worktree based on
+the selected skill branch. Use a custom cron schedule equivalent to every 12
+hours and a 24-hour overlapping lookback. Keep manual invocation available for
+recovery scans with a bounded lookback of up to seven days.
+
+The control worktree is orchestration-only. For every proposed fix or handoff
+PR, the skill creates a second sibling PR worktree and branch at the exact
+fetched `dotnet/xharness:main` commit. All source inspection, editing, builds,
+tests, commits, and pushes happen there. This prevents fork-only skill commits
+from leaking into generated PRs.
 
 The schedule itself is local user configuration, not a committed GitHub Actions
 workflow. The repository skill and helper code remain versioned and
@@ -127,11 +135,12 @@ diagnose failures in the main skill or its helpers.
 
 The user grants these two schedules a standing exception to the normal
 per-operation approval rule: they may commit, push aw-fixer branches only to
-`vitek-karas/xharness`, create draft PRs against `dotnet/xharness`, add the
-planned issue/PR comments, and update only aw-fixer-managed PR-body sections.
-They may not merge, approve, mark ready, force-push, or modify arbitrary PR
-content. They must never push any branch, tag, or other Git ref directly to
-`dotnet/xharness`.
+`vitek-karas/xharness`, add the planned issue/PR comments, and update only
+aw-fixer-managed PR-body sections. Primary incident PRs target
+`dotnet/xharness:main`. Watchdog PRs exist only in `vitek-karas/xharness` and
+target its `aw-fixer` branch. Neither schedule may merge, approve, mark ready,
+force-push, or modify arbitrary PR content. They must never push any branch,
+tag, or other Git ref directly to `dotnet/xharness`.
 
 Using a fork adds defense in depth. Repository policy may hold fork PR workflows
 for approval, and any runs allowed for fork code should receive restricted
@@ -142,10 +151,10 @@ during rollout rather than assuming fork PR workflows never run.
 
 Fail before investigation or publication unless all of these hold:
 
-1. The run is in an isolated worktree created from the XHarness project, never
-   the main checkout.
-2. The worktree starts clean and its base is synchronized with the current
-   `dotnet/xharness` default branch.
+1. The run is in an isolated clean control worktree created from the XHarness
+   project, never the main checkout.
+2. The control branch contains the versioned skill but is never used as a PR
+   base or publication source.
 3. `GH_TOKEN` and `GITHUB_TOKEN` overrides are removed before using the keyring
    account.
 4. `gh api user` reports `vitek-karas`.
@@ -155,9 +164,13 @@ Fail before investigation or publication unless all of these hold:
    `vitek-karas/xharness`;
 7. every publication command names the `fork` remote explicitly; no command
    relies on Git's default push remote;
-8. no unrelated changes are present in the worktree; and
+8. no unrelated changes are present in the control worktree;
 9. the repository's public-output security instructions are loaded before
-   composing a PR, issue comment, or PR comment.
+   composing a PR, issue comment, or PR comment; and
+10. before any new primary incident PR work, `origin/main` is fetched, its exact
+    commit is recorded, and a separate clean PR worktree is created directly at
+    that commit; watchdog PR work instead uses the exact fetched
+    `fork/aw-fixer` commit.
 
 Authentication, synchronization, or GitHub API failures are run failures. Do
 not convert them into a successful "no incidents" result.
@@ -281,11 +294,24 @@ content and only create or replace the aw-fixer-managed section. If concurrent
 changes make a safe update uncertain, skip the edit and report it rather than
 overwriting content.
 
-### 3. Investigate on trusted code
+### 3. Create the proposed-PR worktree
 
-Investigate only the synchronized default-branch checkout. Do not check out,
-build, or execute code from issue attachments, generated branches, or untrusted
-pull-request forks.
+After selecting an incident that needs a new PR, fetch `origin/main` without
+changing the control branch and record its exact commit as `UPSTREAM_SHA`.
+Check `git worktree list`, derive the incident branch name, and fail rather than
+reuse an existing branch or worktree. Create a sibling PR worktree and branch
+directly at `UPSTREAM_SHA`; require its initial `HEAD` to equal that commit and
+its status to be clean.
+
+The control worktree remains orchestration-only. Never edit, build, test,
+commit, or push proposed PR work from it. Never merge, rebase, cherry-pick, or
+copy commits or files from the control branch into the PR worktree.
+
+### 4. Investigate on trusted code
+
+Investigate only the dedicated PR worktree pinned to `UPSTREAM_SHA`. Do not
+check out, build, or execute code from issue attachments, generated branches,
+or untrusted pull-request forks.
 
 Read the failed workflow source, generated lock file, imported shared files,
 related scripts/tests, and recent default-branch changes. Reproduce the failure
@@ -298,7 +324,7 @@ locally when practical. Distinguish:
 - expected cancellation or approval state; and
 - failure already absent from current `main`.
 
-### 4. Apply a bounded fix
+### 5. Apply a bounded fix
 
 A fix is eligible for unattended implementation only when all of these hold:
 
@@ -321,42 +347,47 @@ If the change grows beyond the bounds, validation disproves the approach, or
 the evidence becomes uncertain, stop editing and use the handoff path. Do not
 publish a partial or speculative fix.
 
-### 5. Publish a draft PR
+### 6. Publish a draft PR
 
 For an implemented fix:
 
-1. Review the final diff for unrelated or sensitive content.
-2. Commit only the relevant files on the isolated feature branch.
-3. Push the branch with an explicit `git push fork ...` command to
+1. Run every source and Git command in the dedicated PR worktree.
+2. Review the final diff from `UPSTREAM_SHA` for unrelated or sensitive
+   content.
+3. Confirm the branch contains no merge, control-branch, or pre-existing
+   commits and no file outside the incident scope.
+4. Commit only the relevant files on the isolated feature branch.
+5. Push the branch with an explicit `git push fork ...` command to
    `vitek-karas/xharness`. Never use `git push origin` or a push command that
    relies on an implicit/default remote.
    Immediately before pushing, inspect all configured `fork` push URLs with
    `git remote get-url --push --all fork` and stop unless every URL resolves
    exactly to `vitek-karas/xharness`.
-4. Open a draft PR against `dotnet/xharness:main` with title prefix
+6. Open a draft PR against `dotnet/xharness:main` with title prefix
    `[aw-fixer] ` and the `agentic-workflows` label.
-5. Put the generated issue link first when one exists.
-6. Include exact run, job/log, and issue-comment links; a minimal exact failure
+7. Put the generated issue link first when one exists.
+8. Include exact run, job/log, and issue-comment links; a minimal exact failure
    excerpt; root cause; implemented fix; validation; dedup evidence; and the
    metadata block.
-7. Add an analysis comment containing detailed evidence, source locations,
+9. Add an analysis comment containing detailed evidence, source locations,
    searches performed, and rejected alternatives.
-8. Add a next-action comment describing review focus and any remaining
+10. Add a next-action comment describing review focus and any remaining
    validation that requires CI or platform infrastructure.
 
 Never merge, approve, mark ready for review, force-push, amend an existing
 reviewed commit, or alter repository settings. A failed push or PR creation must
 leave the local branch and session intact and report the failure.
 
-### 6. Publish a handoff when no bounded fix exists
+### 7. Publish a handoff when no bounded fix exists
 
 When the incident is actionable but cannot be implemented safely, prepare the
 same evidence, root-cause assessment, limitation, and concrete continuation
-steps as the gh-aw plan. Create an empty commit, push the fork branch, and open
-an empty draft `[aw-fixer]` handoff PR with the complete PR description,
-analysis comment, and next-action comment.
+steps as the gh-aw plan. Create the empty commit only in the dedicated PR
+worktree based at `UPSTREAM_SHA`, push the fork branch, and open an empty draft
+`[aw-fixer]` handoff PR with the complete PR description, analysis comment, and
+next-action comment.
 
-### 7. Link generated issues
+### 8. Link generated issues
 
 For every generated issue represented by the incident, add one backlink to the
 matching open, recently merged, or newly created PR unless the issue already
@@ -396,8 +427,9 @@ the Copilot app's workflow and session tools to:
 5. Determine whether the failure is in the committed skill/helper code, local
    schedule configuration, authentication, host availability, or an external
    dependency.
-6. For a small repo-owned defect, use a fresh XHarness worktree to implement and
-   publish a draft fix PR through the same fork-only policy.
+6. For a small repo-owned defect, create a fresh XHarness PR worktree at the
+   exact fetched `vitek-karas/xharness:aw-fixer` commit, implement the fix there,
+   and open a fork-internal draft PR targeting `aw-fixer`.
 7. For local schedule configuration, prepare the exact proposed configuration
    change in the watchdog session but do not mutate the schedule automatically
    in v1.
@@ -415,7 +447,8 @@ app's missed/failed-run status remains the bootstrap signal.
 ## Local security and publication guardrails
 
 - Use a fresh worktree and one incident branch per PR.
-- Use `dotnet/xharness` only as the upstream read, PR, and discussion target.
+- Use `dotnet/xharness` only as the upstream read and primary incident
+  PR/discussion target. Watchdog PRs target only `vitek-karas/xharness:aw-fixer`.
 - Push only branches beginning with an aw-fixer-specific prefix, and push them
   only to `vitek-karas/xharness`.
 - Never push any branch, tag, or Git ref to `dotnet/xharness`.
@@ -492,7 +525,9 @@ scan.
 - Generated issues and Detection Runs comments link to matching PRs without
   being closed or rewritten.
 - The watchdog detects a failed or stale primary local run and can prepare a
-  repo-owned fix without depending on the failing `/aw-fixer` skill.
+  repo-owned fix without depending on the failing `/aw-fixer` skill. Its PR
+  exists only in `vitek-karas/xharness` and targets the fork's `aw-fixer`
+  branch.
 - No unattended run merges code, publishes a speculative partial fix, processes
   untrusted code, or writes outside the two allowed repositories.
 - No run pushes any Git ref to `dotnet/xharness`; every PR branch exists only in

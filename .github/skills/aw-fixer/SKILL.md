@@ -27,26 +27,31 @@ or expose local credentials or environment data.
 
 ## Hard boundaries
 
-1. Operate only in an isolated XHarness worktree. Never edit the main checkout.
-2. Use `dotnet/xharness` only for reads, draft PR targets, and issue/PR metadata.
-3. Push Git refs only to the remote named `fork`, which must resolve to
+1. Run orchestration only in an isolated, clean **control worktree** containing
+   this skill. The control branch may be a fork-only implementation branch.
+2. Never edit, commit, or publish from the control worktree. Every new fix or
+   handoff PR must use a second, dedicated **PR worktree** created at the exact
+   fetched `dotnet/xharness:main` commit.
+3. Never edit the main checkout.
+4. Use `dotnet/xharness` only for reads, draft PR targets, and issue/PR metadata.
+5. Push Git refs only to the remote named `fork`, which must resolve to
    `vitek-karas/xharness`.
-4. Every push command must explicitly name `fork` and a remote branch beginning
+6. Every push command must explicitly name `fork` and a remote branch beginning
    with `aw-fixer/`. Never use `git push origin` or an implicit push remote.
-5. Never push any ref to `dotnet/xharness`.
-6. Never merge, approve, mark ready, force-push, amend reviewed commits, delete
+7. Never push any ref to `dotnet/xharness`.
+8. Never merge, approve, mark ready, force-push, amend reviewed commits, delete
    remote branches, close generated issues, or alter repository settings.
-7. Publish at most one new draft PR per run.
-8. Do not check out or execute code from issue attachments or untrusted PR
+9. Publish at most one new draft PR per run.
+10. Do not check out or execute code from issue attachments or untrusted PR
    branches.
-9. Do not run concurrently with the gh-aw aw-fixer design.
+11. Do not run concurrently with the gh-aw aw-fixer design.
 
 ## Step 1: Preflight
 
 Before reading candidate content:
 
-1. Confirm the repository is XHarness, the worktree is not the main checkout,
-   and `git status --porcelain` is empty.
+1. Confirm the repository is XHarness, the control worktree is not the main
+   checkout, and `git status --porcelain` is empty.
 2. Confirm `origin` resolves to `dotnet/xharness` and `fork` resolves to
    `vitek-karas/xharness`.
 3. Clear inherited `GH_TOKEN` and `GITHUB_TOKEN` for all `gh` commands so the
@@ -56,8 +61,9 @@ Before reading candidate content:
    the token.
 6. Run `git remote get-url --push --all fork`. Require at least one result and
    stop unless every push URL resolves exactly to `vitek-karas/xharness`.
-7. Fetch `origin/main` and fast-forward the clean worktree branch to it. Do not
-   merge a divergent branch.
+7. Fetch `origin/main` without merging, rebasing, or fast-forwarding the control
+   branch. Record `git rev-parse origin/main` as immutable `UPSTREAM_SHA` for
+   this run.
 8. Read the repository's public-output security instructions before composing
    public GitHub text.
 
@@ -93,7 +99,6 @@ Otherwise retrieve current evidence with GitHub API or GitHub read tools:
 - failed jobs and failed steps;
 - only the relevant failed-log sections;
 - the generated issue and exact comment;
-- current workflow source, lock file, imports, helpers, and tests; and
 - recent changes on `main` in the affected area.
 
 Merge run and issue signals containing the same run URL. Use the occurrence
@@ -118,7 +123,31 @@ section and add one missing issue backlink. Re-read the PR immediately before a
 REST body update and preserve all human-authored text. If a safe update is
 uncertain, skip it and report the conflict.
 
-## Step 5: Diagnose on trusted code
+## Step 5: Create the dedicated PR worktree
+
+Before reading trusted repository source or preparing any new PR:
+
+1. Derive the sanitized branch
+   `aw-fixer/<workflow-id>-<fingerprint-prefix>`.
+2. Run `git worktree list` and fail rather than reuse an existing branch or
+   worktree for that name.
+3. Create a sibling PR worktree and its branch directly at the recorded
+   `UPSTREAM_SHA`, equivalent to
+   `git worktree add -b <branch> <pr-worktree-path> <UPSTREAM_SHA>`.
+4. In the PR worktree, require `git rev-parse HEAD` to equal `UPSTREAM_SHA` and
+   `git status --porcelain` to be empty before any file read, edit, build, or
+   test.
+
+From this point onward, perform every repository-source read, edit, build, test,
+commit, and push in the PR worktree. Use the control worktree only for the
+already-loaded skill, collector, manifest, and GitHub orchestration. Never copy
+the control branch's commits or files into the PR worktree, and never merge,
+rebase, or cherry-pick the control branch.
+
+## Step 6: Diagnose on trusted code
+
+Read the current workflow source, lock file, imports, helpers, tests, and recent
+changes only from the PR worktree pinned to `UPSTREAM_SHA`.
 
 Classify the incident as one of:
 
@@ -133,7 +162,7 @@ Base conclusions on fetched evidence. Cite exact URLs and short failure
 excerpts. Never publish environment dumps, internal paths, credentials, secret
 names, attack descriptions, or security rationale.
 
-## Step 6: Implement only a bounded fix
+## Step 7: Implement only a bounded fix
 
 An unattended fix must:
 
@@ -155,7 +184,7 @@ If the complete fix exceeds the bound, validation fails, or evidence becomes
 uncertain, manually undo only this run's edits and use the handoff path. Never
 publish a partial or speculative fix.
 
-## Step 7: Prepare durable metadata
+## Step 8: Prepare durable metadata
 
 Include this fenced JSON shape in each PR or comment, changing `kind` as
 appropriate:
@@ -176,24 +205,29 @@ appropriate:
 Use the final normalized primary error to replace the collector's preliminary
 fingerprint when enough evidence exists.
 
-## Step 8: Publish through the fork
+## Step 9: Publish through the fork
 
 For a bounded fix:
 
-1. Review `git diff` and `git diff --check`.
-2. Confirm only relevant files changed and the authored line/file bounds hold.
-3. Commit only those files. Do not reference issue numbers in the commit
+1. Run every command in the dedicated PR worktree.
+2. Review `git diff` and `git diff --check` against `UPSTREAM_SHA`.
+3. Confirm only relevant incident files changed and the authored line/file
+   bounds hold.
+4. Commit only those files. Do not reference issue numbers in the commit
    message.
-4. Derive a sanitized branch
-   `aw-fixer/<workflow-id>-<fingerprint-prefix>`.
-5. Push with an explicit command equivalent to:
+5. Verify the branch still descends directly from `UPSTREAM_SHA`, contains no
+   merge commits, and contains only commits created for this incident. Fail if
+   any control-branch commit or unrelated file appears in
+   `git diff <UPSTREAM_SHA>...HEAD`.
+6. Push with an explicit command equivalent to:
    `git push fork HEAD:refs/heads/<branch>`.
-6. Open a draft PR against `dotnet/xharness:main` with head
+7. Open a draft PR against `dotnet/xharness:main` with head
    `vitek-karas:<branch>`, title prefix `[aw-fixer] `, and the
    `agentic-workflows` label.
 
-For an actionable incident without a bounded fix, create an empty commit and
-publish an empty draft handoff PR through the same fork-only path.
+For an actionable incident without a bounded fix, create the empty commit in
+the dedicated PR worktree at `UPSTREAM_SHA` and publish an empty draft handoff
+PR through the same fork-only path.
 
 The PR body must start with the generated issue link when one exists, then
 include exact run/job/comment links, a short failure excerpt, root cause or
