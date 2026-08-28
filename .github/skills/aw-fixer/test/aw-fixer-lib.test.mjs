@@ -63,9 +63,13 @@ test("parses only valid aw-fixer fenced metadata", () => {
 \`\`\`json
 {"example": true}
 \`\`\`
+<details>
+<summary>aw-fixer fingerprint</summary>
+
 \`\`\`json
 {"aw_fixer":{"schema":1,"kind":"fix-pr","occurrence_keys":["run:1"]}}
 \`\`\`
+</details>
 \`\`\`json
 {invalid}
 \`\`\`

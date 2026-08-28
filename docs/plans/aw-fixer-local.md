@@ -232,7 +232,12 @@ Build:
    job/step + normalized primary error.
 
 Continue using the same fenced metadata shape as the gh-aw plan so either
-implementation can recognize the other's work:
+implementation can recognize the other's work. In locally authored PR bodies,
+PR comments, and issue backlinks, wrap the JSON fence in a collapsible block:
+
+````markdown
+<details>
+<summary>aw-fixer fingerprint</summary>
 
 ```json
 {
@@ -246,6 +251,12 @@ implementation can recognize the other's work:
   }
 }
 ```
+</details>
+````
+
+Keep human-readable evidence outside the `<details>` element. The wrapper is
+presentation-only; the fenced JSON payload remains the deterministic
+deduplication contract.
 
 Do not depend only on title similarity. Exact IDs, URLs, and metadata take
 precedence over model-based semantic matching.

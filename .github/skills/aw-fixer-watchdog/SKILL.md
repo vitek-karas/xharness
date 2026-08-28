@@ -92,11 +92,12 @@ lines across at most three files:
 10. open a draft `[aw-fixer]` PR in `vitek-karas/xharness` with base
     `aw-fixer` and head `aw-fixer-watchdog/<failure-fingerprint>`; and
 11. include the failed local workflow/session evidence, diagnosis, validation,
-   and the normal aw-fixer fenced metadata.
+   and the normal aw-fixer metadata wrapped in the canonical collapsible
+   `<details>` block.
 12. Add exactly two PR comments: an **Analysis** comment with evidence,
-    diagnosis, changed lines, validation, and `kind: "analysis"` metadata; and a
-    **Next action** comment with the maintainer's next step and
-    `kind: "next-action"` metadata.
+   diagnosis, changed lines, validation, and `kind: "analysis"` metadata in the
+   collapsible block; and a **Next action** comment with the maintainer's next
+   step and `kind: "next-action"` metadata in the collapsible block.
 
 For a schedule prompt/configuration defect, prepare the exact proposed
 configuration change in the watchdog session but do not mutate the local

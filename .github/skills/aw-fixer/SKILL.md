@@ -188,8 +188,13 @@ publish a partial or speculative fix.
 
 ## Step 8: Prepare durable metadata
 
-Include this fenced JSON shape in each PR or comment, changing `kind` as
-appropriate:
+Include this metadata in each PR body, PR comment, and issue backlink, changing
+`kind` as appropriate. Always wrap the fenced JSON in this collapsible block so
+the fingerprint does not dominate the human-readable content:
+
+````markdown
+<details>
+<summary>aw-fixer fingerprint</summary>
 
 ```json
 {
@@ -203,6 +208,12 @@ appropriate:
   }
 }
 ```
+</details>
+````
+
+Keep the summary text and wrapper exact. Do not put other content inside this
+`<details>` element. The JSON fence remains machine-readable for existing
+deduplication.
 
 Use the final normalized primary error to replace the collector's preliminary
 fingerprint when enough evidence exists.
