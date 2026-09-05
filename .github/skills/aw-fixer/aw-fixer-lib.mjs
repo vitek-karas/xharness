@@ -409,26 +409,19 @@ function issueBacklinkExists(
   });
 }
 
-function pullRequestCommentExists(signal, pullRequestEntry, kind) {
+function pullRequestCommentExists(pullRequestEntry, kind) {
   return pullRequestEntry.comments.some((comment) => {
     if (normalizeLogin(comment.user?.login) !== "vitek-karas") {
       return false;
     }
 
     return parseAwFixerMetadata(comment.body).some(
-      (metadata) =>
-        metadata.kind === kind &&
-        ((signal.preliminaryFingerprint &&
-          metadata.incident_fingerprint ===
-            signal.preliminaryFingerprint) ||
-          metadata.occurrence_keys?.some((key) =>
-            signal.occurrenceKeys.includes(key),
-          )),
+      (metadata) => metadata.kind === kind,
     );
   });
 }
 
-function managedPullRequestActions(signal, pullRequestEntry) {
+function managedPullRequestActions(pullRequestEntry) {
   if (
     pullRequestEntry.pullRequest.state !== "open" ||
     !pullRequestEntry.managed
@@ -450,7 +443,7 @@ function managedPullRequestActions(signal, pullRequestEntry) {
   }
 
   for (const kind of ["analysis", "next-action"]) {
-    if (!pullRequestCommentExists(signal, pullRequestEntry, kind)) {
+    if (!pullRequestCommentExists(pullRequestEntry, kind)) {
       actions.push({
         type: "add_pr_comment",
         kind,
@@ -510,7 +503,7 @@ function linkActions(signal, pullRequestEntry, commentsByIssue) {
     }
   }
 
-  actions.push(...managedPullRequestActions(signal, pullRequestEntry));
+  actions.push(...managedPullRequestActions(pullRequestEntry));
 
   return actions;
 }
@@ -544,10 +537,7 @@ function managedPullRequestRepairCandidate(pullRequestEntry) {
       (metadata) => metadata.incident_fingerprint,
     )?.incident_fingerprint,
   };
-  const requiredActions = managedPullRequestActions(
-    signal,
-    pullRequestEntry,
-  );
+  const requiredActions = managedPullRequestActions(pullRequestEntry);
 
   if (requiredActions.length === 0) {
     return undefined;

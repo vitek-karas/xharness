@@ -285,6 +285,42 @@ test("repairs missing managed PR comments idempotently", () => {
   ]);
 });
 
+test("does not duplicate managed PR comments for a later occurrence", () => {
+  const inventory = structuredClone(fixture);
+  const laterRunUrl =
+    "https://github.com/dotnet/xharness/actions/runs/103";
+  inventory.runsByWorkflow[10].push({
+    id: 103,
+    run_attempt: 1,
+    event: "schedule",
+    head_sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    status: "completed",
+    conclusion: "failure",
+    created_at: "2026-08-27T13:00:00Z",
+    html_url: laterRunUrl,
+  });
+  inventory.jobsByRun[103] = [
+    {
+      id: 1030,
+      name: "different-agent",
+      conclusion: "failure",
+      steps: [{ name: "Different failure", number: 4, conclusion: "failure" }],
+    },
+  ];
+  inventory.issues.find((issue) => issue.number === 1699).body +=
+    `\nAnother occurrence: ${laterRunUrl}`;
+
+  const manifest = buildCandidateManifest(inventory, { now });
+
+  assert.equal(
+    manifest.candidates.find((candidate) =>
+      candidate.occurrenceKeys.includes("run:103"),
+    ),
+    undefined,
+  );
+  assert.equal(manifest.summary.exactHandledCount, 2);
+});
+
 test("repairs managed PR comments after source evidence ages out", () => {
   const inventory = {
     pullRequests: [
