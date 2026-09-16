@@ -101,15 +101,15 @@ test("builds an ordered manifest and merges run and issue evidence", () => {
   );
   assert.deepEqual(manifest.reviewedRunIds, [100, 101, 102, 200]);
   assert.deepEqual(manifest.diagnostics.ignoredWorkflowIds, [12, 13]);
-  assert.equal(manifest.summary.signalCount, 8);
+  assert.equal(manifest.summary.signalCount, 6);
   assert.equal(manifest.summary.exactHandledCount, 1);
-  assert.equal(manifest.summary.candidateCount, 4);
+  assert.equal(manifest.summary.candidateCount, 2);
   assert.equal(manifest.summary.truncated, false);
 
-  assert.equal(manifest.candidates[0].generatedIssue.number, 1700);
+  assert.equal(manifest.candidates[0].generatedIssue.number, 1702);
   assert.equal(
     manifest.candidates[1].generatedIssue.commentId,
-    6002,
+    6001,
   );
 
   const cancelled = manifest.candidates.find((candidate) =>
@@ -132,7 +132,7 @@ test("builds an ordered manifest and merges run and issue evidence", () => {
   assert.equal(selfFailure.generatedIssue.commentId, 6001);
 });
 
-test("keeps old open generated issues and ignores human comments", () => {
+test("keeps recent failure reports and ignores stale or human comments", () => {
   const manifest = buildCandidateManifest(fixture, {
     now,
     maxCandidates: 50,
@@ -140,12 +140,29 @@ test("keeps old open generated issues and ignores human comments", () => {
 
   assert.ok(
     manifest.candidates.some(
-      (candidate) => candidate.generatedIssue?.number === 1700,
+      (candidate) => candidate.generatedIssue?.number === 1702,
+    ),
+  );
+  assert.ok(
+    manifest.candidates.some((candidate) =>
+      candidate.occurrenceKeys.includes("issue-comment:6001"),
     ),
   );
   assert.equal(
     manifest.candidates.some((candidate) =>
       candidate.occurrenceKeys.includes("issue-comment:5003"),
+    ),
+    false,
+  );
+  assert.equal(
+    manifest.candidates.some(
+      (candidate) => candidate.generatedIssue?.number === 1700,
+    ),
+    false,
+  );
+  assert.equal(
+    manifest.candidates.some((candidate) =>
+      candidate.occurrenceKeys.includes("issue-comment:6002"),
     ),
     false,
   );
@@ -158,11 +175,11 @@ test("applies oldest-first candidate caps", () => {
   });
 
   assert.equal(manifest.candidates.length, 2);
-  assert.equal(manifest.summary.candidateCount, 4);
+  assert.equal(manifest.summary.candidateCount, 2);
   assert.equal(manifest.summary.returnedCandidateCount, 2);
-  assert.equal(manifest.summary.truncated, true);
-  assert.equal(manifest.candidates[0].generatedIssue.number, 1700);
-  assert.equal(manifest.candidates[1].generatedIssue.commentId, 6002);
+  assert.equal(manifest.summary.truncated, false);
+  assert.equal(manifest.candidates[0].generatedIssue.number, 1702);
+  assert.equal(manifest.candidates[1].generatedIssue.commentId, 6001);
 });
 
 test("does not treat URL prefixes as exact matches", () => {

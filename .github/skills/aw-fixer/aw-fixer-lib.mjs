@@ -8,6 +8,7 @@ export const FAILURE_CONCLUSIONS = new Set([
 ]);
 
 const DETECTION_RUNS_MARKER = "<!-- gh-aw-detection-runs -->";
+const ISSUE_LOOKBACK_HOURS = 48;
 const RUN_URL_PATTERN =
   /https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/actions\/runs\/(\d+)/gi;
 
@@ -206,19 +207,23 @@ function runSignals(inventory, currentWorkflows, cutoff) {
   return signals;
 }
 
-function issueOccurrenceSignals(issue, comment, isDetectionRuns) {
+function issueOccurrenceSignals(issue, comment, isDetectionRuns, cutoff) {
   const text = comment?.body ?? issue.body ?? "";
   const issueUrl = issue.html_url;
   const occurrenceUrl = comment?.html_url ?? issueUrl;
   const occurrenceKey = comment
     ? `issue-comment:${comment.id}`
     : `issue:${issue.id}`;
+  const occurredAt = comment?.created_at ?? issue.created_at;
+  if (timestamp(occurredAt) < cutoff) {
+    return [];
+  }
   const references = extractRunReferences(text);
   const common = {
     type: isDetectionRuns ? "detection-run" : "generated-issue",
     occurrenceKeys: [occurrenceKey],
     sourceIssues: unique([issueUrl, occurrenceUrl]),
-    occurredAt: comment?.created_at ?? issue.created_at,
+    occurredAt,
     generatedIssue: {
       id: issue.id,
       number: issue.number,
@@ -241,7 +246,7 @@ function issueOccurrenceSignals(issue, comment, isDetectionRuns) {
   }));
 }
 
-function issueSignals(inventory) {
+function issueSignals(inventory, cutoff) {
   const signals = [];
 
   for (const issue of (inventory.issues ?? []).filter(isGeneratedAwIssue)) {
@@ -253,10 +258,12 @@ function issueSignals(inventory) {
     );
 
     if (!isDetectionRuns) {
-      signals.push(...issueOccurrenceSignals(issue, undefined, false));
+      signals.push(...issueOccurrenceSignals(issue, undefined, false, cutoff));
     }
     for (const comment of comments) {
-      signals.push(...issueOccurrenceSignals(issue, comment, isDetectionRuns));
+      signals.push(
+        ...issueOccurrenceSignals(issue, comment, isDetectionRuns, cutoff),
+      );
     }
   }
 
@@ -582,9 +589,11 @@ export function buildCandidateManifest(
   );
   const workflowIds = new Set(currentWorkflows.map((workflow) => workflow.id));
   const cutoff = nowValue.valueOf() - lookbackHours * 60 * 60 * 1000;
+  const issueCutoff =
+    nowValue.valueOf() - ISSUE_LOOKBACK_HOURS * 60 * 60 * 1000;
   const allSignals = [
     ...runSignals(inventory, currentWorkflows, cutoff),
-    ...issueSignals(inventory),
+    ...issueSignals(inventory, issueCutoff),
   ];
   const pullRequests = pullRequestIndex(
     inventory.pullRequests,

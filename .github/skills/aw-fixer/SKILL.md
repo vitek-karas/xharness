@@ -82,9 +82,11 @@ node .github/skills/aw-fixer/collect-candidates.mjs --repo dotnet/xharness --exp
 For a recovery scan, replace `24` with the requested value up to `168`.
 
 The collector inventories current `.agent.md` and `.agent.lock.yml` pairs,
-recent completed runs, all qualifying open generated `[aw]` issues, Detection
-Runs comments, and exact open/recently-merged PR matches. It emits a bounded
-JSON manifest and never modifies GitHub or the worktree.
+recent completed runs, generated `[aw]` issue occurrences reported within the
+last 48 hours, Detection Runs comments, and exact open/recently-merged PR
+matches. It emits a bounded JSON manifest and never modifies GitHub or the
+worktree. Older occurrences remain eligible only for repairs to already-managed
+aw-fixer PR metadata.
 
 If collection fails or returns malformed/incomplete data, fail the run. If it
 returns no candidates, report the reviewed-run count and stop successfully.
