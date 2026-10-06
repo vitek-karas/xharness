@@ -1,0 +1,34 @@
+{
+  "requests": [
+    {
+      "tool": "search_issues",
+      "arguments": {
+        "owner": "dotnet",
+        "repo": "xharness",
+        "query": "repo:dotnet/xharness is:issue in:title \"[runtime-observer]\"",
+        "page": 1,
+        "perPage": 100
+      },
+      "responses": [
+        {"items": [], "total_count": 0, "incomplete_results": false},
+        {"items": [], "total_count": 0, "incomplete_results": false},
+        {"items": [], "total_count": 0, "incomplete_results": false}
+      ]
+    },
+    {
+      "tool": "search_pull_requests",
+      "arguments": {
+        "owner": "dotnet",
+        "repo": "xharness",
+        "query": "repo:dotnet/xharness is:pr in:title \"[runtime-observer]\"",
+        "page": 1,
+        "perPage": 100
+      },
+      "responses": [
+        {"items": [], "total_count": 0, "incomplete_results": false},
+        {"items": [], "total_count": 0, "incomplete_results": false},
+        {"items": [], "total_count": 0, "incomplete_results": false}
+      ]
+    }
+  ]
+}

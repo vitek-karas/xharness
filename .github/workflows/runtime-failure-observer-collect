@@ -1,0 +1,2341 @@
+#!/usr/bin/env python3
+
+r"""Prepare the runtime failure observer's CI evidence before AI analysis.
+
+Purpose
+-------
+This is the deterministic collection and preparation phase, not the investigator.
+It selects a bounded set of dotnet/runtime CI builds and packages their relevant
+AzDO/Helix evidence and consumed XHarness source revisions for offline analysis.
+The later agent decides whether failures suggest XHarness fixes and reads live
+GitHub issues/PRs for context and deduplication. This script neither performs that
+investigation nor edits source files, creates PRs, or collects issue/PR data.
+
+Processing steps
+----------------
+1. Fix a UTC scan time and query the main-branch builds for each definition in
+   DEFINITIONS. From a bounded list of failed/partially-succeeded builds, select
+   the latest failure within seven days and up to five preceding failures.
+   History builds may be older than seven days; there are at most 54 selected
+   builds across the nine definitions.
+2. Prepare selected build metadata through hlx, then traverse complete timelines.
+   Read only successful Helix submission logs to discover job IDs. Enumerate
+   each job's complete work-item inventory, skipping passing work items and
+   negative Helix service exits before requesting full failure consoles.
+3. Parse XHarness invocation boundaries, terminal exit codes, version SHAs, and
+   diagnostic signatures. Alias expansion must not create duplicate invocations;
+   child-tool exits must not be mistaken for XHarness exits. Retain evidence
+   identities and console line ranges alongside normalized commands/signatures.
+4. Compute recurrence within each definition using the exact normalized
+   (XHarness exit code, command, signature) tuple. Analysis requires an exit in
+   IMPROVEMENT_EXIT_CODES and matches in two distinct preceding history builds.
+   Mark history-only, weak, out-of-scope, and duplicate source tuples as skips;
+   keep them in the full index rather than silently discarding them.
+5. Resolve consumed XHarness revisions for source improvement candidates:
+   prefer the console's informational-version SHA, otherwise fetch runtime's
+   eng/Version.Details.xml at the exact build revision. Ensure the starting and
+   consumed revisions and bounded history are available, then package them in a
+   validated bare repository. Fetches may update Git objects/metadata, but the
+   supplied checkout's HEAD and working files are not changed.
+6. Export and validate the isolated hlx cache as an offline snapshot, then write
+   the handoff files. Explicit retention/policy skips are nonfatal; missing
+   required evidence, ambiguous parsing, source preparation, or snapshot errors
+   make the scan incomplete. Snapshot finalization and diagnostic output are
+   still attempted after a collection failure.
+
+Invocation
+----------
+Run from the XHarness repository root with Python 3, git, and an installed hlx
+executable matching HLX_VERSION (currently 0.11.0):
+
+    python3 .github/workflows/runtime-failure-observer-collect \
+        --output-dir /tmp/observer-collection \
+        --xharness-repo "$PWD" \
+        --hlx /path/to/hlx \
+        --now 2026-10-06T12:00:00Z
+
+--output-dir must not already exist, even as an empty directory. --xharness-repo
+must be the checkout root, not a subdirectory. --now is optional RFC3339 input;
+without it, the CLI captures the current UTC time once. A fixed clock fixes the
+selection policy, not the contents of live services. The workflow installs and
+verifies the hlx package before invoking this script.
+
+Outputs and completion
+----------------------
+All paths below are relative to --output-dir; JSON results are files, not stdout:
+
+    observer-manifest.json  Policy/clock, selection, full traversal inventories,
+                            provenance, counts, skips/errors, snapshot/source
+                            validation, and output hashes.
+    failure-index.json      All parsed invocations from failed work-item
+                            consoles, separate Helix/XHarness exit codes,
+                            recurrence, analysis decisions, and evidence refs.
+    analysis-inputs.json    Compact starting input for the agent: manifest
+                            projection, eligible source tuples, one witness per
+                            matching history build, and aggregated skip counts.
+    filed.tsv               Empty ledger for the agent's same-run PR tracking.
+    hlx-snapshot/           Validated raw CI evidence for hlx offline MCP replay
+                            via HLX_EVAL_SNAPSHOT.
+    source/xharness.git     Bare Git package of starting/consumed revisions and
+                            history; not the editable workflow checkout.
+    version-details/       Exact runtime version files, when fallback resolution
+                            was needed, with hashes recorded in the manifest.
+    hlx-manifests/          Per-build provider acquisition diagnostics.
+    xdg-cache/hlx/public/   Isolated provider cache; retain for failed-export
+                            diagnostics, not as a substitute for the snapshot.
+
+Schema version 1 is used for the JSON handoff. Exit 0 means a complete scan;
+exit 2 means a recorded incomplete scan; exit 1 indicates a startup error.
+Argument validation also uses exit 2 and may produce no files. Consumers must
+check manifest.complete/status/errors and required outputs, not just the exit
+code. manifest.empty is true only for a complete scan with no source exits in
+the improvement table; it does not simply mean analysis-inputs has no eligible
+tuples. The workflow's runtime-failure-observer-handoff.py validates this contract
+and emits noop/missing_data; the collector itself emits neither safe output.
+
+Implementation map and tests
+----------------------------
+ObserverCollector.run orchestrates the phases; select_builds and
+parse_xharness_invocations implement selection/parsing; build_analysis_inputs
+creates the compact projection. HlxV011Provider uses hlx CLI and MCP calls against
+one shared isolated cache. GitHubVersionDetailsResolver and GitSourcePreparer
+handle exact-revision metadata and source/history preparation. EvidenceProvider,
+VersionResolver, and SourcePreparer are injectable boundaries for deterministic
+unit tests; the CLI wires their live implementations. See
+tests/test_runtime_failure_observer_collect.py beside the workflow and
+docs/runtime-observer.md for operational/replay guidance.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as dt
+import hashlib
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any, Protocol
+
+
+SCHEMA_VERSION = 1
+COLLECTOR_VERSION = "0.1"
+HLX_VERSION = "0.11.0"
+HLX_COMMIT = "e713995ea5070429f4aee44cfbdbe35dd632d37a"
+HLX_PACKAGE = "lewing.helix.mcp.0.11.0.nupkg"
+HLX_PACKAGE_SHA256 = (
+    "757bdd7fd021a95b85ec6d1d7478138996fb5692ffb5172caaf457667e0b743e"
+)
+DEFINITIONS = {
+    154: "runtime-extra-platforms",
+    223: "runtime-android",
+    224: "runtime-androidemulator",
+    225: "runtime-ioslike",
+    226: "runtime-ioslikesimulator",
+    228: "runtime-maccatalyst",
+    260: "runtime-ioslike-coreclr",
+    261: "runtime-ioslike-mono",
+    265: "runtime-nativeaot-outerloop",
+}
+IMPROVEMENT_EXIT_CODES = {70, 71, 78, 79, 80, 81, 82, 83}
+BUILD_LIST_LIMIT = 10
+HLX_BUILD_QUERY_LIMIT = 100
+HISTORY_BUILD_LIMIT = 5
+SCAN_WINDOW = dt.timedelta(days=7)
+SOURCE_HISTORY_DEPTH = 200
+VERSION_DETAILS_LIMIT = 4 * 1024 * 1024
+HLX_COMMAND_TIMEOUT = 300
+HLX_MCP_TIMEOUT = 120
+
+_SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_GUID = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_HEX_SHA = re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE)
+_URL = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+_WINDOWS_PATH = re.compile(r"(?<![\w])(?:[A-Za-z]:\\|\\\\)[^\s\"']+")
+_UNIX_PATH = re.compile(r"(?<![\w:])/(?:[^\s\"':]+/)*[^\s\"':]*")
+_TIMESTAMP = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ][0-2]\d:[0-5]\d:[0-5]\d"
+    r"(?:\.\d+)?(?:Z|[+-][0-2]\d:[0-5]\d)?\b",
+    re.IGNORECASE,
+)
+_DURATION = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:milliseconds?|msecs?|ms|seconds?|secs?|minutes?|mins?)\b",
+    re.IGNORECASE,
+)
+_HELIX_MACHINE = re.compile(
+    r"\b(?:helix|dnceng)[a-z0-9][a-z0-9._-]{3,}\b", re.IGNORECASE
+)
+_TERMINAL_EXIT_CODE = re.compile(
+    r"^\s{0,2}"
+    r"(?:\bExit\s*code\b|\b(?:Process\s+)?exited\s+with\s+code\b|\bExitCode\b)"
+    r"\s*(?::|=)?\s*(-?\d+)\b",
+    re.IGNORECASE,
+)
+_XHARNESS_COMMAND_ISSUED = re.compile(
+    r"\bXHarness command issued:\s*(.+)$",
+    re.IGNORECASE,
+)
+_XHARNESS_EXIT_CODE = re.compile(
+    r"\bXHarness exit code:\s*(-?\d+)\b",
+    re.IGNORECASE,
+)
+_INFORMATIONAL_SHA = re.compile(
+    r"\b(?:Microsoft\.DotNet\.)?XHarness(?:\.[A-Za-z0-9.]+)?"
+    r"[^\r\n+]*\+[^\r\n+]*?([0-9a-f]{40})\b",
+    re.IGNORECASE,
+)
+_ISSUED_INFORMATIONAL_SHA = re.compile(
+    r"\[[^\]\r\n+]*\+[^\]\r\n+]*?([0-9a-f]{40})\]\s+"
+    r"XHarness command issued:",
+    re.IGNORECASE,
+)
+_HELIX_JOB = re.compile(
+    r"(?:Sent Helix Job:\s*|Sent Helix Job;\s*see work items at "
+    r"https://helix\.dot\.net/api/jobs/)"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r"(?:/workitems)?",
+    re.IGNORECASE,
+)
+_RUNNING_COMMAND = re.compile(r"\bRunning command\b\s*(?::|-)\s*(.+)$", re.IGNORECASE)
+_XHARNESS_COMMAND = re.compile(
+    r"(?:"
+    r"(?:^|\s)(?:[^\s\"']*[\\/])?xharness(?:\.exe)?\s+"
+    r"(?:apple|android|wasm)\b"
+    r"|"
+    r"(?:^|\s)dotnet(?:\.exe)?\s+exec\s+"
+    r"(?:\"[^\"]*Microsoft\.DotNet\.XHarness\.CLI\.dll\"|"
+    r"'[^']*Microsoft\.DotNet\.XHarness\.CLI\.dll'|"
+    r"[^\s\"']*Microsoft\.DotNet\.XHarness\.CLI\.dll)\b"
+    r")",
+    re.IGNORECASE,
+)
+_ERROR_HINT = re.compile(
+    r"\b(?:error|failed|failure|exception|timed?\s*out|timeout|"
+    r"not\s+found|unable|cannot|could\s+not|crash(?:ed)?)\b",
+    re.IGNORECASE,
+)
+_GENERIC_LINE = re.compile(
+    r"^\s*(?:"
+    r"running command\b|exit\s*code\b|process exited with code\b|"
+    r"xharness(?:\s+version)?\b|microsoft \(r\)|[-=]{3,}"
+    r")",
+    re.IGNORECASE,
+)
+
+
+class CollectorError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.scope = scope or {}
+
+    def as_json(self) -> dict[str, Any]:
+        return {"code": self.code, "message": str(self), "scope": self.scope}
+
+
+@dataclasses.dataclass(frozen=True)
+class EvidenceValue:
+    value: Any
+    identity: dict[str, Any]
+    complete: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
+class TextEvidence:
+    text: str | None
+    identity: dict[str, Any]
+    outcome: str = "ok"
+    detail: str | None = None
+
+
+class EvidenceProvider(Protocol):
+    version: str
+    metadata: dict[str, Any]
+
+    def list_builds(self, definition_id: int, limit: int) -> EvidenceValue: ...
+
+    def prepare(self, selected_builds: list[dict[str, Any]]) -> None: ...
+
+    def timeline(self, build_id: int) -> EvidenceValue: ...
+
+    def build_log(self, build_id: int, log_id: int) -> TextEvidence: ...
+
+    def helix_work_items(self, job_id: str) -> EvidenceValue: ...
+
+    def helix_console(self, job_id: str, work_item_name: str) -> TextEvidence: ...
+
+    def finalize(self, *, complete: bool) -> dict[str, Any]: ...
+
+
+class VersionResolver(Protocol):
+    def resolve(self, runtime_sha: str) -> dict[str, Any]: ...
+
+
+class SourcePreparer(Protocol):
+    def starting_revision(self) -> str: ...
+
+    def prepare(self, consumed_shas: set[str], output_dir: Path) -> dict[str, Any]: ...
+
+
+def _field(value: dict[str, Any], *names: str) -> Any:
+    folded = {key.casefold(): item for key, item in value.items()}
+    for name in names:
+        if name.casefold() in folded:
+            return folded[name.casefold()]
+    return None
+
+
+def _require_dict(value: Any, description: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CollectorError("invalid_evidence", f"{description} is not an object")
+    return value
+
+
+def _require_list(value: Any, description: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise CollectorError("invalid_evidence", f"{description} is not an array")
+    return value
+
+
+def _parse_rfc3339(value: Any, description: str) -> dt.datetime:
+    if not isinstance(value, str) or not value:
+        raise CollectorError("invalid_evidence", f"{description} is not an RFC3339 string")
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError as error:
+        raise CollectorError(
+            "invalid_evidence", f"{description} is not an RFC3339 timestamp"
+        ) from error
+    if parsed.tzinfo is None:
+        raise CollectorError("invalid_evidence", f"{description} lacks a timezone")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _utc_text(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _stable_json(value: Any) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.new")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sanitize(value: str) -> str:
+    value = _URL.sub("<url>", value)
+    value = _GUID.sub("<guid>", value)
+    value = _HEX_SHA.sub("<sha>", value)
+    value = _TIMESTAMP.sub("<timestamp>", value)
+    value = _WINDOWS_PATH.sub("<path>", value)
+    value = _UNIX_PATH.sub("<path>", value)
+    value = _HELIX_MACHINE.sub("<machine>", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_command(value: str) -> str:
+    return _sanitize(value).casefold()
+
+
+def normalize_signature(value: str) -> str:
+    value = re.sub(r"^\s*\[\d{2}:\d{2}:\d{2}(?:\.\d+)?\]\s*", "", value)
+    value = _DURATION.sub("<duration>", _sanitize(value))
+    value = re.sub(r"\b0x[0-9a-f]+\b", "<address>", value, flags=re.IGNORECASE)
+    return value.casefold()
+
+
+def _command_from_line(line: str) -> str | None:
+    running = _RUNNING_COMMAND.search(line)
+    candidate = running.group(1).strip() if running else line.strip()
+    if _XHARNESS_COMMAND.search(candidate):
+        return candidate
+    return None
+
+
+def _command_arguments(command: str) -> str | None:
+    match = re.search(r"\b(apple|android|wasm)\b(?:\s+.*)?$", command, re.IGNORECASE)
+    return normalize_command(match.group(0)) if match else None
+
+
+def _command_launcher(command: str) -> str | None:
+    if re.search(r"(?:^|\s)dotnet(?:\.exe)?\s+exec\s+", command, re.IGNORECASE):
+        return "dotnet"
+    if re.search(
+        r"(?:^|\s)(?:[^\s\"']*[\\/])?xharness(?:\.exe)?\s+",
+        command,
+        re.IGNORECASE,
+    ):
+        return "xharness"
+    return None
+
+
+def _command_markers(lines: list[str]) -> list[tuple[int, str, bool]]:
+    commands: list[tuple[int, str, bool]] = []
+    for index, line in enumerate(lines):
+        issued = _XHARNESS_COMMAND_ISSUED.search(line)
+        if issued is not None:
+            command = issued.group(1).strip()
+            previous_has_exit = (
+                commands
+                and any(
+                    _XHARNESS_EXIT_CODE.search(candidate)
+                    or _TERMINAL_EXIT_CODE.search(candidate)
+                    for candidate in lines[commands[-1][0] + 1 : index]
+                )
+            )
+            if (
+                commands
+                and not commands[-1][2]
+                and not previous_has_exit
+                and _command_arguments(commands[-1][1])
+                == _command_arguments(command)
+            ):
+                commands[-1] = (index, command, True)
+            else:
+                commands.append((index, command, True))
+            continue
+        command = _command_from_line(line)
+        if command is None:
+            continue
+        if commands and index == commands[-1][0] + 1:
+            previous_arguments = _command_arguments(commands[-1][1])
+            current_arguments = _command_arguments(command)
+            if (
+                not commands[-1][2]
+                and _command_launcher(commands[-1][1]) == "xharness"
+                and _command_launcher(command) == "dotnet"
+                and previous_arguments is not None
+                and previous_arguments == current_arguments
+            ):
+                commands[-1] = (index, command, False)
+                continue
+        commands.append((index, command, False))
+    return commands
+
+
+def _diagnostic_signature(lines: list[str], invocation: int, exit_line: int) -> str:
+    # The result JSON and streamed child logs can follow the actual failure by
+    # hundreds of lines. Prefer the CLI logger's error over artifact metadata.
+    primary = [
+        line.strip()
+        for line in lines[invocation + 1 : exit_line]
+        if re.match(r"^\s*(?:\[\d{2}:\d{2}:\d{2}(?:\.\d+)?\]\s*)?(?:fail|error|crit):", line, re.IGNORECASE)
+    ]
+    if primary:
+        return primary[-1]
+    context = []
+    in_result = False
+    for line in lines[invocation + 1 : exit_line]:
+        if "<<XHARNESS_RESULT_START>>" in line:
+            in_result = True
+        elif "<<XHARNESS_RESULT_END>>" in line:
+            in_result = False
+        elif not in_result:
+            context.append(line)
+    context = context[-50:]
+    meaningful = [
+        line.strip()
+        for line in context
+        if line.strip() and not _GENERIC_LINE.search(line)
+    ]
+    hinted = [line for line in meaningful if _ERROR_HINT.search(line)]
+    if hinted:
+        return hinted[0]
+    if meaningful:
+        return meaningful[-1]
+    raise CollectorError(
+        "missing_invocation_diagnostic",
+        "XHarness invocation has an exit code but no diagnostic line",
+    )
+
+
+def parse_xharness_invocations(console: str) -> list[dict[str, Any]]:
+    lines = console.splitlines()
+    commands = _command_markers(lines)
+    invocations: list[dict[str, Any]] = []
+    for command_index, (line_index, command, authoritative_marker) in enumerate(commands):
+        segment_end = (
+            commands[command_index + 1][0] if command_index + 1 < len(commands) else len(lines)
+        )
+        exit_matches: list[tuple[int, int]] = []
+        for index in range(line_index + 1, segment_end):
+            exit_match = (
+                _XHARNESS_EXIT_CODE.search(lines[index])
+                if authoritative_marker
+                else _TERMINAL_EXIT_CODE.search(lines[index])
+            )
+            if exit_match is not None:
+                exit_matches.append((index, int(exit_match.group(1))))
+        if not exit_matches:
+            raise CollectorError(
+                "missing_xharness_exit_code",
+                "XHarness command has no process exit code",
+                scope={"invocationLine": line_index + 1},
+            )
+        distinct_codes = {code for _, code in exit_matches}
+        if len(distinct_codes) != 1:
+            raise CollectorError(
+                "ambiguous_xharness_exit_code",
+                "XHarness command has multiple distinct process exit codes",
+                scope={
+                    "invocationLine": line_index + 1,
+                    "exitCodes": sorted(distinct_codes),
+                },
+            )
+        exit_index, exit_code = exit_matches[-1]
+        segment = "\n".join(lines[line_index:segment_end])
+        informational = _ISSUED_INFORMATIONAL_SHA.search(segment)
+        if informational is None:
+            informational = _INFORMATIONAL_SHA.search(segment)
+        if informational is None and len(commands) == 1:
+            informational = _ISSUED_INFORMATIONAL_SHA.search(console)
+        if informational is None and len(commands) == 1:
+            informational = _INFORMATIONAL_SHA.search(console)
+        signature = _diagnostic_signature(lines, line_index, exit_index)
+        excerpt_start = max(line_index + 1, exit_index - 50)
+        invocations.append(
+            {
+                "command": _sanitize(command),
+                "commandNorm": normalize_command(command),
+                "exitCode": exit_code,
+                "signature": _sanitize(signature),
+                "signatureNorm": normalize_signature(signature),
+                "informationalVersionSha": (
+                    informational.group(1).lower() if informational else None
+                ),
+                "lineRange": {
+                    "invocation": line_index + 1,
+                    "diagnosticStart": excerpt_start + 1,
+                    "exit": exit_index + 1,
+                },
+                "diagnosticExcerpt": [
+                    _sanitize(line)
+                    for line in lines[excerpt_start:exit_index]
+                    if line.strip()
+                ][-50:],
+            }
+        )
+    return invocations
+
+
+def parse_version_details(document: bytes) -> str:
+    try:
+        root = ET.fromstring(document)
+    except ET.ParseError as error:
+        raise CollectorError(
+            "invalid_version_details", "runtime Version.Details.xml is malformed"
+        ) from error
+    shas: set[str] = set()
+    for dependency in root.iter("Dependency"):
+        uri = dependency.findtext("Uri")
+        sha = dependency.findtext("Sha")
+        if (
+            isinstance(uri, str)
+            and uri.rstrip("/").casefold() == "https://github.com/dotnet/xharness"
+            and isinstance(sha, str)
+            and _SHA.fullmatch(sha)
+        ):
+            shas.add(sha.lower())
+    if len(shas) != 1:
+        raise CollectorError(
+            "invalid_version_details",
+            "runtime Version.Details.xml must identify exactly one XHarness revision",
+            scope={"distinctXHarnessRevisions": sorted(shas)},
+        )
+    return next(iter(shas))
+
+
+class GitHubVersionDetailsResolver:
+    def resolve(self, runtime_sha: str) -> dict[str, Any]:
+        if not _SHA.fullmatch(runtime_sha):
+            raise CollectorError(
+                "missing_runtime_revision",
+                "runtime build did not provide a valid source revision",
+                scope={"runtimeSha": runtime_sha},
+            )
+        runtime_sha = runtime_sha.lower()
+        url = (
+            "https://raw.githubusercontent.com/dotnet/runtime/"
+            f"{runtime_sha}/eng/Version.Details.xml"
+        )
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"User-Agent": "xharness-runtime-failure-observer-collector/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                final_url = response.geturl()
+                if final_url != url:
+                    raise CollectorError(
+                        "version_details_redirect",
+                        "runtime version metadata redirected away from the exact revision",
+                        scope={"requested": url, "actual": final_url},
+                    )
+                data = response.read(VERSION_DETAILS_LIMIT + 1)
+        except urllib.error.HTTPError as error:
+            raise CollectorError(
+                "version_details_unavailable",
+                f"runtime Version.Details.xml request failed with status {error.code}",
+                scope={"runtimeSha": runtime_sha},
+            ) from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise CollectorError(
+                "version_details_unavailable",
+                f"runtime Version.Details.xml request failed: {error}",
+                scope={"runtimeSha": runtime_sha},
+            ) from error
+        if len(data) > VERSION_DETAILS_LIMIT:
+            raise CollectorError(
+                "version_details_too_large",
+                "runtime Version.Details.xml exceeded the size limit",
+                scope={"runtimeSha": runtime_sha},
+            )
+        return {
+            "xharnessSha": parse_version_details(data),
+            "provenance": {
+                "kind": "runtime-version-details",
+                "runtimeSha": runtime_sha,
+                "url": url,
+                "sha256": hashlib.sha256(data).hexdigest(),
+            },
+            "content": data,
+        }
+
+
+class GitSourcePreparer:
+    def __init__(self, repository: Path) -> None:
+        self.repository = repository.resolve()
+        top_level = Path(self._git("rev-parse", "--show-toplevel")).resolve()
+        if top_level != self.repository:
+            raise CollectorError(
+                "invalid_xharness_checkout",
+                "--xharness-repo must name the checkout root",
+                scope={"expected": str(top_level), "actual": str(self.repository)},
+            )
+        self._starting_revision = self._git("rev-parse", "HEAD")
+        if not _SHA.fullmatch(self._starting_revision):
+            raise CollectorError(
+                "invalid_xharness_checkout", "checkout HEAD is not a full Git revision"
+            )
+
+    @staticmethod
+    def _git_environment() -> dict[str, str]:
+        return {
+            **os.environ,
+            "GCM_INTERACTIVE": "Never",
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+
+    def _git(self, *arguments: str, check: bool = True) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(self.repository), *arguments],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._git_environment(),
+        )
+        if check and result.returncode:
+            raise CollectorError(
+                "git_command_failed",
+                result.stderr.strip() or f"git {' '.join(arguments)} failed",
+                scope={"arguments": list(arguments), "exitCode": result.returncode},
+            )
+        return result.stdout.strip()
+
+    def starting_revision(self) -> str:
+        return self._starting_revision
+
+    def _has_commit(self, revision: str) -> bool:
+        return (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.repository),
+                    "cat-file",
+                    "-e",
+                    f"{revision}^{{commit}}",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=self._git_environment(),
+            ).returncode
+            == 0
+        )
+
+    def _is_shallow(self) -> bool:
+        return self._git("rev-parse", "--is-shallow-repository") == "true"
+
+    def _history_count(self, revision: str) -> int:
+        value = self._git(
+            "rev-list",
+            f"--max-count={SOURCE_HISTORY_DEPTH}",
+            "--count",
+            revision,
+        )
+        try:
+            return int(value)
+        except ValueError as error:
+            raise CollectorError(
+                "git_command_failed",
+                "git returned an invalid history count",
+                scope={"revision": revision, "value": value},
+            ) from error
+
+    def _ensure_commit(self, revision: str) -> dict[str, Any]:
+        has_commit = self._has_commit(revision)
+        if has_commit and (
+            not self._is_shallow()
+            or self._history_count(revision) >= SOURCE_HISTORY_DEPTH
+        ):
+            return {
+                "sha": revision,
+                "fetched": False,
+                "historyCommitCount": self._history_count(revision),
+            }
+        remotes = self._git("remote").splitlines()
+        attempted: list[str] = []
+        for remote in ("origin", "upstream"):
+            if remote not in remotes:
+                continue
+            attempted.append(remote)
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.repository),
+                    "fetch",
+                    "--no-tags",
+                    f"--depth={SOURCE_HISTORY_DEPTH}",
+                    remote,
+                    revision,
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self._git_environment(),
+            )
+            if result.returncode == 0 and self._has_commit(revision):
+                history_count = self._history_count(revision)
+                if not self._is_shallow() or history_count >= SOURCE_HISTORY_DEPTH:
+                    return {
+                        "sha": revision,
+                        "fetched": True,
+                        "remote": remote,
+                        "historyCommitCount": history_count,
+                    }
+        raise CollectorError(
+            "xharness_revision_unavailable",
+            "required consumed XHarness revision and bounded history are not available",
+            scope={
+                "sha": revision,
+                "requiredHistoryCommitCount": SOURCE_HISTORY_DEPTH,
+                "attemptedRemotes": attempted,
+            },
+        )
+
+    def prepare(self, consumed_shas: set[str], output_dir: Path) -> dict[str, Any]:
+        starting_commit = self._ensure_commit(self._starting_revision)
+        commits = [self._ensure_commit(sha) for sha in sorted(consumed_shas)]
+        if self._git("rev-parse", "HEAD") != self._starting_revision:
+            raise CollectorError(
+                "checkout_changed",
+                "XHarness checkout revision changed during source preparation",
+            )
+
+        package = output_dir / "source" / "xharness.git"
+        if package.exists():
+            raise CollectorError(
+                "source_package_exists",
+                "source package path already exists",
+                scope={"path": str(package)},
+            )
+        package.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--bare", str(package)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._git_environment(),
+        )
+        references = {"refs/heads/observer-start": self._starting_revision}
+        for sha in sorted(consumed_shas):
+            references[f"refs/heads/consumed/{sha}"] = sha
+        for reference, revision in references.items():
+            result = subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(package),
+                    "fetch",
+                    "--no-tags",
+                    str(self.repository),
+                    f"{revision}:{reference}",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self._git_environment(),
+            )
+            if result.returncode:
+                raise CollectorError(
+                    "source_package_failed",
+                    result.stderr.strip() or "could not package XHarness source",
+                    scope={"revision": revision, "reference": reference},
+                )
+        fsck = subprocess.run(
+            ["git", "--git-dir", str(package), "fsck", "--full"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._git_environment(),
+        )
+        if fsck.returncode:
+            raise CollectorError(
+                "source_package_invalid",
+                fsck.stderr.strip() or "packaged XHarness repository failed validation",
+            )
+        if self._git("rev-parse", "HEAD") != self._starting_revision:
+            raise CollectorError(
+                "checkout_changed",
+                "XHarness checkout revision changed during source packaging",
+            )
+        return {
+            "startingRevision": self._starting_revision,
+            "endingRevision": self._starting_revision,
+            "checkoutUnchanged": True,
+            "historyPolicy": {
+                "minimumCommitCount": SOURCE_HISTORY_DEPTH,
+                "startingRevision": starting_commit,
+            },
+            "requiredConsumedRevisions": commits,
+            "package": {
+                "kind": "bare-git-repository",
+                "path": str(package.relative_to(output_dir)),
+                "references": references,
+                "validation": "git fsck --full",
+                "validated": True,
+            },
+        }
+
+
+def _extract_builds(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [_require_dict(item, "build") for item in payload]
+    document = _require_dict(payload, "build-list response")
+    values = _field(document, "value", "builds")
+    return [
+        _require_dict(item, "build")
+        for item in _require_list(values, "build-list response value")
+    ]
+
+
+def _build_record(
+    raw: dict[str, Any], definition_id: int, now: dt.datetime
+) -> dict[str, Any]:
+    build_id = _field(raw, "id", "buildId")
+    if not isinstance(build_id, int) or build_id <= 0:
+        raise CollectorError("invalid_evidence", "build id is not a positive integer")
+    result = _field(raw, "result")
+    if not isinstance(result, str) or result.casefold() not in {
+        "failed",
+        "partiallysucceeded",
+    }:
+        raise CollectorError(
+            "invalid_evidence",
+            "build-list response contains a build outside the failed result filter",
+            scope={"buildId": build_id, "result": result},
+        )
+    finish = _parse_rfc3339(_field(raw, "finishTime"), "build finishTime")
+    if finish > now:
+        raise CollectorError(
+            "invalid_evidence",
+            "build finishTime is later than the fixed scan time",
+            scope={"buildId": build_id, "finishTime": _utc_text(finish)},
+        )
+    definition = _field(raw, "definition")
+    actual_definition = (
+        _field(definition, "id") if isinstance(definition, dict) else _field(raw, "definitionId")
+    )
+    if actual_definition is not None and actual_definition != definition_id:
+        raise CollectorError(
+            "invalid_evidence",
+            "build belongs to a different definition",
+            scope={
+                "buildId": build_id,
+                "expectedDefinition": definition_id,
+                "actualDefinition": actual_definition,
+            },
+        )
+    source_version = _field(raw, "sourceVersion")
+    web_url = _field(raw, "url", "webUrl")
+    links = _field(raw, "_links", "links")
+    if isinstance(links, dict):
+        web = _field(links, "web")
+        if isinstance(web, dict):
+            web_url = _field(web, "href") or web_url
+    if not isinstance(web_url, str) or not web_url:
+        raise CollectorError(
+            "invalid_evidence",
+            "build metadata has no fetched web URL",
+            scope={"buildId": build_id},
+        )
+    return {
+        "id": build_id,
+        "definitionId": definition_id,
+        "definitionName": DEFINITIONS[definition_id],
+        "result": result,
+        "finishTime": _utc_text(finish),
+        "finishTimeValue": finish,
+        "runtimeSha": source_version.lower()
+        if isinstance(source_version, str) and _SHA.fullmatch(source_version)
+        else None,
+        "url": web_url,
+    }
+
+
+def select_builds(
+    payload: Any,
+    definition_id: int,
+    now: dt.datetime,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    builds = [_build_record(item, definition_id, now) for item in _extract_builds(payload)]
+    builds.sort(key=lambda item: (item["finishTimeValue"], item["id"]), reverse=True)
+    window_start = now - SCAN_WINDOW
+    source_index = next(
+        (
+            index
+            for index, build in enumerate(builds)
+            if build["finishTimeValue"] >= window_start
+        ),
+        None,
+    )
+    if source_index is None:
+        return None, []
+    source = builds[source_index]
+    selected = [source, *builds[source_index + 1 : source_index + 1 + HISTORY_BUILD_LIMIT]]
+    for index, build in enumerate(selected):
+        build["role"] = "source" if index == 0 else "history"
+        del build["finishTimeValue"]
+    return source, selected
+
+
+def _timeline_records(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        values = payload
+    else:
+        document = _require_dict(payload, "timeline response")
+        values = _field(document, "records", "value")
+    return [
+        _require_dict(item, "timeline record")
+        for item in _require_list(values, "timeline records")
+    ]
+
+
+def _submission_records(payload: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    successful: dict[int, dict[str, Any]] = {}
+    skips: list[dict[str, Any]] = []
+    for record in _timeline_records(payload):
+        name = _field(record, "name", "displayName")
+        if not isinstance(name, str):
+            continue
+        folded = name.casefold()
+        is_submission = (
+            "helix" in folded
+            and ("send" in folded or "submit" in folded)
+            and "monitor" not in folded
+        )
+        if not is_submission:
+            continue
+        result = _field(record, "result")
+        if not isinstance(result, str):
+            raise CollectorError(
+                "invalid_evidence",
+                "Helix submission task has no result",
+                scope={"task": name},
+            )
+        if result.casefold() not in {"succeeded", "succeededwithissues"}:
+            skips.append(
+                {
+                    "kind": "policy",
+                    "reason": "helix_job_not_submitted",
+                    "task": name,
+                    "result": result,
+                }
+            )
+            continue
+        log = _field(record, "log")
+        log_id = _field(log, "id") if isinstance(log, dict) else _field(record, "logId")
+        if not isinstance(log_id, int) or log_id <= 0:
+            raise CollectorError(
+                "invalid_evidence",
+                "successful Helix submission task has no positive log id",
+                scope={"task": name},
+            )
+        successful.setdefault(log_id, {"logId": log_id, "task": name, "result": result})
+    return list(successful.values()), skips
+
+
+def _work_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        values = payload
+    else:
+        document = _require_dict(payload, "Helix work-item response")
+        values = _field(document, "value", "workItems")
+    return [
+        _require_dict(item, "Helix work item")
+        for item in _require_list(values, "Helix work items")
+    ]
+
+
+def _work_item(item: dict[str, Any]) -> dict[str, Any]:
+    name = _field(item, "name", "workItemName")
+    exit_code = _field(item, "exitCode")
+    if not isinstance(name, str) or not name:
+        raise CollectorError("invalid_evidence", "Helix work item has no non-empty name")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        raise CollectorError(
+            "invalid_evidence",
+            "Helix work item ExitCode is not an integer",
+            scope={"workItem": name},
+        )
+    return {"name": name, "exitCode": exit_code}
+
+
+def _retention_skip(
+    skips: list[dict[str, Any]],
+    reason: str,
+    *,
+    build_id: int,
+    identity: dict[str, Any],
+    detail: str | None = None,
+) -> None:
+    item = {
+        "kind": "retention",
+        "reason": reason,
+        "buildId": build_id,
+        "evidence": identity,
+    }
+    if detail:
+        item["detail"] = detail
+    skips.append(item)
+
+
+def build_analysis_inputs(
+    manifest: dict[str, Any], failure_index: dict[str, Any]
+) -> dict[str, Any]:
+    # Complete inventories can be megabytes; inference needs selected tuples,
+    # one recurrence witness per history build, and the stable manifest contract.
+    history: dict[tuple[int, str], dict[int, dict[str, Any]]] = {}
+    skip_counts: dict[str, int] = {}
+    inventory = failure_index["candidates"] if manifest["complete"] else []
+    for candidate in inventory:
+        if candidate["buildRole"] == "history":
+            key = (candidate["definitionId"], candidate["exactTuple"])
+            history.setdefault(key, {}).setdefault(candidate["buildId"], candidate)
+        if not candidate["analysisRequired"]:
+            reason = candidate["analysisSkipReason"]
+            skip_counts[reason] = skip_counts.get(reason, 0) + 1
+
+    history_fields = (
+        "id", "definitionId", "buildId", "buildUrl", "jobId", "workItemName",
+        "helixExitCode", "xharnessExitCode", "commandNorm", "signatureNorm",
+        "informationalVersionSha", "evidence",
+    )
+    candidates = []
+    for candidate in inventory:
+        if not candidate["analysisRequired"]:
+            continue
+        matches = history.get((candidate["definitionId"], candidate["exactTuple"]), {})
+        witnesses = [
+            {field: matches[build_id][field] for field in history_fields}
+            for build_id in candidate["recurrence"]["matchingHistoryBuildIds"]
+        ]
+        candidates.append({**candidate, "history": witnesses})
+
+    manifest_fields = (
+        "schemaVersion", "kind", "status", "complete", "empty", "asOf",
+        "policy", "counts", "coverage", "source", "versionFiles", "errors",
+    )
+    acquisition_skips: dict[tuple[str, str], int] = {}
+    for skip in manifest["skips"]:
+        key = (skip["kind"], skip["reason"])
+        acquisition_skips[key] = acquisition_skips.get(key, 0) + 1
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "manifest": {field: manifest[field] for field in manifest_fields},
+        "candidates": candidates,
+        "skipCounts": dict(sorted(skip_counts.items())),
+        "acquisitionSkipCounts": [
+            {"kind": kind, "reason": reason, "count": count}
+            for (kind, reason), count in sorted(acquisition_skips.items())
+        ],
+    }
+
+
+class ObserverCollector:
+    def __init__(
+        self,
+        *,
+        provider: EvidenceProvider,
+        version_resolver: VersionResolver,
+        source_preparer: SourcePreparer,
+        output_dir: Path,
+        now: dt.datetime,
+    ) -> None:
+        self.provider = provider
+        self.version_resolver = version_resolver
+        self.source_preparer = source_preparer
+        self.output_dir = output_dir.resolve()
+        self.now = now.astimezone(dt.timezone.utc)
+        self.errors: list[dict[str, Any]] = []
+        self.skips: list[dict[str, Any]] = []
+        self.definitions: list[dict[str, Any]] = []
+        self.builds: list[dict[str, Any]] = []
+        self.candidates: list[dict[str, Any]] = []
+        self.traversal: list[dict[str, Any]] = []
+        self.version_files: list[dict[str, Any]] = []
+        self.source: dict[str, Any] = {
+            "startingRevision": source_preparer.starting_revision()
+        }
+        self.snapshot: dict[str, Any] = {}
+
+    def _record_candidate(
+        self,
+        *,
+        build: dict[str, Any],
+        job_id: str,
+        work_item: dict[str, Any],
+        console: TextEvidence,
+        invocation: dict[str, Any],
+    ) -> None:
+        candidate_id = (
+            f"{build['definitionId']}:{build['id']}:{job_id}:"
+            f"{hashlib.sha256(work_item['name'].encode()).hexdigest()[:12]}:"
+            f"{invocation['lineRange']['invocation']}"
+        )
+        exact_tuple = (
+            f"{invocation['exitCode']}|{invocation['commandNorm']}|"
+            f"{invocation['signatureNorm']}"
+        )
+        self.candidates.append(
+            {
+                "id": candidate_id,
+                "definitionId": build["definitionId"],
+                "definitionName": build["definitionName"],
+                "buildId": build["id"],
+                "buildRole": build["role"],
+                "buildUrl": build["url"],
+                "runtimeSha": build["runtimeSha"],
+                "jobId": job_id,
+                "workItemName": work_item["name"],
+                "helixExitCode": work_item["exitCode"],
+                "xharnessExitCode": invocation["exitCode"],
+                "improvementTarget": invocation["exitCode"] in IMPROVEMENT_EXIT_CODES,
+                "command": invocation["command"],
+                "commandNorm": invocation["commandNorm"],
+                "signature": invocation["signature"],
+                "signatureNorm": invocation["signatureNorm"],
+                "exactTuple": exact_tuple,
+                "informationalVersionSha": invocation["informationalVersionSha"],
+                "consumedXHarnessSha": None,
+                "sourceResolution": None,
+                "evidence": {
+                    "console": console.identity,
+                    "lineRange": invocation["lineRange"],
+                },
+            }
+        )
+
+    def _collect_build(self, build: dict[str, Any]) -> None:
+        timeline = self.provider.timeline(build["id"])
+        if not timeline.complete:
+            raise CollectorError(
+                "incomplete_timeline",
+                "hlx did not return a complete build timeline",
+                scope={"buildId": build["id"], "evidence": timeline.identity},
+            )
+        submissions, task_skips = _submission_records(timeline.value)
+        for skip in task_skips:
+            skip["buildId"] = build["id"]
+        self.skips.extend(task_skips)
+        build_manifest = {
+            **{key: value for key, value in build.items() if key != "finishTimeValue"},
+            "timeline": timeline.identity,
+            "successfulSubmissionCount": len(submissions),
+            "helixJobCount": 0,
+            "failedWorkItemCount": 0,
+            "xharnessInvocationCount": 0,
+        }
+        seen_jobs: set[str] = set()
+        for submission in submissions:
+            log = self.provider.build_log(build["id"], submission["logId"])
+            if log.outcome == "empty" or (log.outcome == "ok" and log.text == ""):
+                _retention_skip(
+                    self.skips,
+                    "empty_helix_evidence",
+                    build_id=build["id"],
+                    identity=log.identity,
+                    detail=log.detail,
+                )
+                continue
+            if log.outcome != "ok" or log.text is None:
+                raise CollectorError(
+                    "submission_log_unavailable",
+                    log.detail or "successful Helix submission log is unavailable",
+                    scope={"buildId": build["id"], "evidence": log.identity},
+                )
+            jobs = list(dict.fromkeys(match.lower() for match in _HELIX_JOB.findall(log.text)))
+            if not jobs:
+                _retention_skip(
+                    self.skips,
+                    "helix_job_identifier_unavailable",
+                    build_id=build["id"],
+                    identity=log.identity,
+                )
+                continue
+            for job_id in jobs:
+                if job_id in seen_jobs:
+                    continue
+                seen_jobs.add(job_id)
+                work_items = self.provider.helix_work_items(job_id)
+                if not work_items.complete:
+                    raise CollectorError(
+                        "incomplete_helix_inventory",
+                        "hlx did not return a complete Helix work-item inventory",
+                        scope={"jobId": job_id, "evidence": work_items.identity},
+                    )
+                build_manifest["helixJobCount"] += 1
+                parsed_work_items = [
+                    _work_item(raw_item) for raw_item in _work_items(work_items.value)
+                ]
+                self.traversal.append(
+                    {
+                        "definitionId": build["definitionId"],
+                        "buildId": build["id"],
+                        "buildRole": build["role"],
+                        "jobId": job_id,
+                        "inventory": work_items.identity,
+                        "workItems": parsed_work_items,
+                    }
+                )
+                for item in parsed_work_items:
+                    if item["exitCode"] < 0:
+                        self.skips.append(
+                            {
+                                "kind": "policy",
+                                "reason": "helix_infrastructure_exit_code",
+                                "buildId": build["id"],
+                                "jobId": job_id,
+                                "workItemName": item["name"],
+                                "helixExitCode": item["exitCode"],
+                            }
+                        )
+                        continue
+                    if item["exitCode"] == 0:
+                        continue
+                    build_manifest["failedWorkItemCount"] += 1
+                    console = self.provider.helix_console(job_id, item["name"])
+                    if console.outcome in {
+                        "empty",
+                        "work_item_unavailable",
+                        "console_404",
+                    } or (console.outcome == "ok" and console.text == ""):
+                        reason = {
+                            "empty": "empty_helix_evidence",
+                            "work_item_unavailable": "helix_work_item_unavailable",
+                            "console_404": "helix_console_unavailable_404",
+                        }.get(console.outcome, "empty_helix_evidence")
+                        _retention_skip(
+                            self.skips,
+                            reason,
+                            build_id=build["id"],
+                            identity=console.identity,
+                            detail=console.detail,
+                        )
+                        continue
+                    if console.outcome != "ok" or console.text is None:
+                        if console.outcome == "missing_console_url":
+                            raise CollectorError(
+                                "helix_console_url_missing",
+                                console.detail
+                                or "Helix work item did not contain a console output URL",
+                                scope={
+                                    "buildId": build["id"],
+                                    "definitionId": build["definitionId"],
+                                    "jobId": job_id,
+                                    "workItemName": item["name"],
+                                    "helixExitCode": item["exitCode"],
+                                    "evidence": console.identity,
+                                },
+                            )
+                        raise CollectorError(
+                            "helix_console_unavailable",
+                            console.detail or "required Helix console is unavailable",
+                            scope={
+                                "buildId": build["id"],
+                                "jobId": job_id,
+                                "workItemName": item["name"],
+                                "evidence": console.identity,
+                            },
+                        )
+                    try:
+                        invocations = parse_xharness_invocations(console.text)
+                    except CollectorError as error:
+                        error.scope.update(
+                            {
+                                "buildId": build["id"],
+                                "definitionId": build["definitionId"],
+                                "jobId": job_id,
+                                "workItemName": item["name"],
+                                "helixExitCode": item["exitCode"],
+                                "evidence": console.identity,
+                            }
+                        )
+                        self.errors.append(error.as_json())
+                        continue
+                    if not invocations:
+                        self.skips.append(
+                            {
+                                "kind": "policy",
+                                "reason": "no_xharness_invocation",
+                                "buildId": build["id"],
+                                "jobId": job_id,
+                                "workItemName": item["name"],
+                                "evidence": console.identity,
+                            }
+                        )
+                        continue
+                    build_manifest["xharnessInvocationCount"] += len(invocations)
+                    for invocation in invocations:
+                        self._record_candidate(
+                            build=build,
+                            job_id=job_id,
+                            work_item=item,
+                            console=console,
+                            invocation=invocation,
+                        )
+        self.builds.append(build_manifest)
+
+    def _compute_recurrence(self) -> None:
+        occurrences: dict[tuple[int, str], set[int]] = {}
+        history = {
+            definition["id"]: set(definition["historyBuildIds"])
+            for definition in self.definitions
+        }
+        seen_source_tuples: set[str] = set()
+        for candidate in self.candidates:
+            key = (candidate["definitionId"], candidate["exactTuple"])
+            occurrences.setdefault(key, set()).add(candidate["buildId"])
+        for candidate in self.candidates:
+            matching = sorted(
+                occurrences[(candidate["definitionId"], candidate["exactTuple"])],
+                reverse=True,
+            )
+            matching_history = sorted(
+                set(matching) & history[candidate["definitionId"]], reverse=True
+            )
+            candidate["recurrence"] = {
+                "matchingBuildIds": matching,
+                "matchingBuildCount": len(matching),
+                "matchingHistoryBuildIds": matching_history,
+                "matchingHistoryBuildCount": len(matching_history),
+                "strong": len(matching_history) >= 2,
+            }
+            reason = None
+            if candidate["buildRole"] != "source":
+                reason = "history evidence only"
+            elif not candidate["improvementTarget"]:
+                reason = "exit code outside improvement table"
+            elif len(matching_history) < 2:
+                reason = "weak signature"
+            elif candidate["exactTuple"] in seen_source_tuples:
+                reason = "duplicate source signature"
+            else:
+                seen_source_tuples.add(candidate["exactTuple"])
+            candidate["analysisRequired"] = reason is None
+            candidate["analysisSkipReason"] = reason
+
+    def _prepare_versions_and_source(self) -> None:
+        resolutions: dict[str, dict[str, Any]] = {}
+        consumed_shas: set[str] = set()
+        for candidate in self.candidates:
+            if candidate["buildRole"] != "source" or not candidate["improvementTarget"]:
+                candidate["sourcePreparationRequired"] = False
+                continue
+            candidate["sourcePreparationRequired"] = True
+            informational = candidate["informationalVersionSha"]
+            if informational:
+                candidate["consumedXHarnessSha"] = informational
+                candidate["sourceResolution"] = {
+                    "kind": "xharness-informational-version",
+                    "console": candidate["evidence"]["console"],
+                }
+                consumed_shas.add(informational)
+                continue
+            runtime_sha = candidate["runtimeSha"]
+            if not runtime_sha:
+                raise CollectorError(
+                    "missing_runtime_revision",
+                    "candidate has no XHarness informational version or runtime source revision",
+                    scope={"candidateId": candidate["id"], "buildId": candidate["buildId"]},
+                )
+            if runtime_sha not in resolutions:
+                resolution = self.version_resolver.resolve(runtime_sha)
+                sha = resolution.get("xharnessSha")
+                if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+                    raise CollectorError(
+                        "invalid_version_resolution",
+                        "version resolver did not return a full XHarness revision",
+                        scope={"runtimeSha": runtime_sha},
+                    )
+                content = resolution.pop("content", None)
+                if content is not None:
+                    if not isinstance(content, bytes):
+                        raise CollectorError(
+                            "invalid_version_resolution",
+                            "version resolver content is not bytes",
+                            scope={"runtimeSha": runtime_sha},
+                        )
+                    path = (
+                        self.output_dir
+                        / "version-details"
+                        / f"runtime-{runtime_sha}.Version.Details.xml"
+                    )
+                    _atomic_write(path, content)
+                    resolution["provenance"]["path"] = str(path.relative_to(self.output_dir))
+                    self.version_files.append(
+                        {
+                            "runtimeSha": runtime_sha,
+                            "path": str(path.relative_to(self.output_dir)),
+                            "sha256": _sha256(path),
+                        }
+                    )
+                resolutions[runtime_sha] = resolution
+            resolution = resolutions[runtime_sha]
+            candidate["consumedXHarnessSha"] = resolution["xharnessSha"].lower()
+            candidate["sourceResolution"] = resolution["provenance"]
+            consumed_shas.add(candidate["consumedXHarnessSha"])
+        self.source = self.source_preparer.prepare(consumed_shas, self.output_dir)
+
+    def _write_outputs(self) -> None:
+        complete = not self.errors
+        selected_build_ids = [
+            build_id
+            for definition in self.definitions
+            for build_id in (
+                ([definition["sourceBuildId"]]
+                if definition["sourceBuildId"] is not None
+                else [])
+                + definition["historyBuildIds"]
+            )
+        ]
+        actionable = [
+            candidate
+            for candidate in self.candidates
+            if candidate["buildRole"] == "source" and candidate["improvementTarget"]
+        ]
+        counts = {
+            "definitions": len(self.definitions),
+            "selectedBuilds": len(selected_build_ids),
+            "successfulSubmissions": sum(
+                build["successfulSubmissionCount"] for build in self.builds
+            ),
+            "helixJobs": sum(build["helixJobCount"] for build in self.builds),
+            "failedWorkItems": sum(build["failedWorkItemCount"] for build in self.builds),
+            "xharnessInvocations": len(self.candidates),
+            "sourceImprovementCandidates": len(actionable),
+            "retentionSkips": sum(skip["kind"] == "retention" for skip in self.skips),
+        }
+        manifest = {
+            "schemaVersion": SCHEMA_VERSION,
+            "kind": "xharness.runtime-failure-observer.collect",
+            "collectorVersion": COLLECTOR_VERSION,
+            "status": "complete" if complete else "incomplete",
+            "complete": complete,
+            "empty": complete and not actionable,
+            "asOf": _utc_text(self.now),
+            "windowStart": _utc_text(self.now - SCAN_WINDOW),
+            "policy": {
+                "definitions": [
+                    {"id": definition_id, "name": name}
+                    for definition_id, name in DEFINITIONS.items()
+                ],
+                "branch": "refs/heads/main",
+                "results": ["failed", "partiallySucceeded"],
+                "buildListLimit": BUILD_LIST_LIMIT,
+                "historyBuildLimit": HISTORY_BUILD_LIMIT,
+                "scanWindowDays": SCAN_WINDOW.days,
+                "improvementExitCodes": sorted(IMPROVEMENT_EXIT_CODES),
+            },
+            "provider": {
+                "name": "hlx",
+                "version": self.provider.version,
+                **self.provider.metadata,
+            },
+            "definitions": self.definitions,
+            "builds": self.builds,
+            "traversal": self.traversal,
+            "snapshot": self.snapshot,
+            "source": self.source,
+            "versionFiles": self.version_files,
+            "skips": self.skips,
+            "errors": self.errors,
+            "counts": counts,
+            "coverage": {
+                "selectedBuildIds": selected_build_ids,
+                "buildSelectionComplete": len(self.definitions) == len(DEFINITIONS),
+                "offlineHelixInventoryComplete": self.snapshot.get("complete") is True,
+            },
+            "outputs": {
+                "failureIndex": "failure-index.json",
+                "manifest": "observer-manifest.json",
+            },
+        }
+        failure_index = {
+            "schemaVersion": SCHEMA_VERSION,
+            "kind": "xharness.runtime-failure-observer.failures",
+            "status": manifest["status"],
+            "complete": complete,
+            "asOf": manifest["asOf"],
+            "candidates": self.candidates,
+            "errors": self.errors,
+        }
+        failure_index_data = _stable_json(failure_index)
+        _atomic_write(self.output_dir / "failure-index.json", failure_index_data)
+        manifest["outputs"]["failureIndexSha256"] = hashlib.sha256(
+            failure_index_data
+        ).hexdigest()
+        analysis_data = _stable_json(build_analysis_inputs(manifest, failure_index))
+        _atomic_write(self.output_dir / "analysis-inputs.json", analysis_data)
+        manifest["outputs"]["analysisInputs"] = "analysis-inputs.json"
+        manifest["outputs"]["analysisInputsSha256"] = hashlib.sha256(analysis_data).hexdigest()
+        _atomic_write(self.output_dir / "filed.tsv", b"")
+        _atomic_write(self.output_dir / "observer-manifest.json", _stable_json(manifest))
+
+    def run(self) -> int:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            selected_builds: list[dict[str, Any]] = []
+            for definition_id, name in DEFINITIONS.items():
+                listing = self.provider.list_builds(definition_id, BUILD_LIST_LIMIT)
+                if not listing.complete:
+                    raise CollectorError(
+                        "incomplete_build_list",
+                        "hlx did not return the complete bounded build list",
+                        scope={
+                            "definitionId": definition_id,
+                            "evidence": listing.identity,
+                        },
+                    )
+                source, selected = select_builds(listing.value, definition_id, self.now)
+                definition_manifest = {
+                    "id": definition_id,
+                    "name": name,
+                    "buildList": listing.identity,
+                    "sourceBuildId": source["id"] if source else None,
+                    "historyBuildIds": [
+                        build["id"] for build in selected if build["role"] == "history"
+                    ],
+                }
+                self.definitions.append(definition_manifest)
+                selected_builds.extend(selected)
+            self.provider.prepare(selected_builds)
+            for build in selected_builds:
+                self._collect_build(build)
+            self._compute_recurrence()
+            self._prepare_versions_and_source()
+        except CollectorError as error:
+            self.errors.append(error.as_json())
+        except Exception as error:
+            self.errors.append(
+                {
+                    "code": "unexpected_collector_failure",
+                    "message": f"{type(error).__name__}: {error}",
+                    "scope": {},
+                }
+            )
+        try:
+            expected_complete = not self.errors
+            self.snapshot = self.provider.finalize(complete=expected_complete)
+            if not isinstance(self.snapshot, dict):
+                raise CollectorError(
+                    "invalid_snapshot_manifest",
+                    "hlx snapshot finalization did not return an object",
+                )
+            has_path = isinstance(self.snapshot.get("path"), str) or (
+                isinstance(self.snapshot.get("paths"), list)
+                and all(isinstance(path, str) for path in self.snapshot["paths"])
+            )
+            if expected_complete and (
+                self.snapshot.get("complete") is not True or not has_path
+            ):
+                raise CollectorError(
+                    "incomplete_snapshot",
+                    "hlx did not produce a complete validated offline snapshot",
+                    scope={"snapshot": self.snapshot},
+                )
+        except CollectorError as error:
+            self.errors.append(error.as_json())
+        except Exception as error:
+            self.errors.append(
+                {
+                    "code": "snapshot_finalize_failed",
+                    "message": f"{type(error).__name__}: {error}",
+                    "scope": {},
+                }
+            )
+        self._write_outputs()
+        return 0 if not self.errors else 2
+
+
+class HlxV011Provider:
+    @staticmethod
+    def _execute(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(arguments, timeout=HLX_COMMAND_TIMEOUT, **kwargs)
+        except subprocess.TimeoutExpired as error:
+            raise CollectorError(
+                "hlx_command_timeout",
+                "hlx command exceeded its deadline",
+                scope={"arguments": arguments[1:], "timeoutSeconds": HLX_COMMAND_TIMEOUT},
+            ) from error
+
+    def __init__(
+        self,
+        executable: Path,
+        output_dir: Path,
+        *,
+        as_of: dt.datetime | None = None,
+    ) -> None:
+        self.executable = executable.resolve()
+        self.output_dir = output_dir.resolve()
+        self.as_of = (as_of or dt.datetime.now(dt.timezone.utc)).astimezone(
+            dt.timezone.utc
+        )
+        if not self.executable.is_file():
+            raise CollectorError(
+                "hlx_executable_unavailable",
+                "the pinned hlx executable does not exist",
+                scope={"executable": str(self.executable)},
+            )
+        result = self._execute(
+            [str(self.executable), "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={
+                **os.environ,
+                "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+                "DOTNET_NOLOGO": "1",
+            },
+        )
+        actual_version = result.stdout.strip()
+        if result.returncode or actual_version != HLX_VERSION:
+            raise CollectorError(
+                "hlx_version_mismatch",
+                "collector requires the pinned hlx release",
+                scope={
+                    "executable": str(self.executable),
+                    "expectedVersion": HLX_VERSION,
+                    "actualVersion": actual_version or None,
+                    "exitCode": result.returncode,
+                    "stderr": result.stderr.strip() or None,
+                },
+            )
+        self.version = actual_version
+        self.metadata = {
+            "commit": HLX_COMMIT,
+            "package": HLX_PACKAGE,
+            "packageSha256": HLX_PACKAGE_SHA256,
+            "collectionPolicy": {
+                "azdoLogScope": "none",
+                "submissionLogs": "full-successful-submissions",
+                "helixScope": "none",
+                "testScope": "none",
+            },
+        }
+        self.cache_home = self.output_dir / "xdg-cache"
+        self.cache_dir = self.cache_home / "hlx"
+        self.snapshot_dir = self.output_dir / "hlx-snapshot"
+        self.manifest_dir = self.output_dir / "hlx-manifests"
+        self.collection_records: list[dict[str, Any]] = []
+        self.snapshot_validation: dict[str, Any] | None = None
+        self.cache_status: dict[str, Any] | None = None
+
+    def _environment(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+            "DOTNET_NOLOGO": "1",
+            "HLX_CACHE_MAX_SIZE_MB": "8192",
+            "XDG_CACHE_HOME": str(self.cache_home),
+        }
+
+    def _run_json(self, arguments: list[str], *, operation: str) -> Any:
+        result = self._execute(
+            [str(self.executable), *arguments],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._environment(),
+        )
+        if result.returncode:
+            raise CollectorError(
+                "hlx_command_failed",
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"hlx {operation} failed",
+                scope={
+                    "operation": operation,
+                    "arguments": arguments,
+                    "exitCode": result.returncode,
+                },
+            )
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise CollectorError(
+                "hlx_invalid_json",
+                f"hlx {operation} returned malformed JSON",
+                scope={"operation": operation, "arguments": arguments},
+            ) from error
+
+    def _run_text(self, arguments: list[str], *, operation: str) -> str:
+        result = self._execute(
+            [str(self.executable), *arguments],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._environment(),
+        )
+        if result.returncode:
+            raise CollectorError(
+                "hlx_command_failed",
+                result.stderr.strip() or f"hlx {operation} failed",
+                scope={
+                    "operation": operation,
+                    "arguments": arguments,
+                    "exitCode": result.returncode,
+                },
+            )
+        return result.stdout
+
+    def _mcp_call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        stderr = tempfile.TemporaryFile(mode="w+t")
+        process = subprocess.Popen(
+            [str(self.executable), "mcp"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            text=True,
+            env=self._environment(),
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        responses: queue.Queue[str | None] = queue.Queue()
+
+        def read_responses() -> None:
+            for line in process.stdout:
+                responses.put(line)
+            responses.put(None)
+
+        reader = threading.Thread(target=read_responses, daemon=True)
+        reader.start()
+
+        next_id = 1
+
+        def send(message: dict[str, Any]) -> None:
+            process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+
+        def request(method: str, parameters: dict[str, Any]) -> dict[str, Any]:
+            nonlocal next_id
+            request_id = next_id
+            next_id += 1
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": parameters,
+                }
+            )
+            deadline = time.monotonic() + HLX_MCP_TIMEOUT
+            while True:
+                try:
+                    line = responses.get(timeout=max(0, deadline - time.monotonic()))
+                except queue.Empty as error:
+                    raise CollectorError(
+                        "hlx_mcp_timeout",
+                        "hlx MCP request exceeded its deadline",
+                        scope={
+                            "tool": tool,
+                            "method": method,
+                            "timeoutSeconds": HLX_MCP_TIMEOUT,
+                        },
+                    ) from error
+                if not line:
+                    stderr.seek(0)
+                    raise CollectorError(
+                        "hlx_mcp_failed",
+                        stderr.read().strip()
+                        or "hlx MCP exited before returning a response",
+                        scope={"tool": tool},
+                    )
+                try:
+                    response = _require_dict(json.loads(line), "hlx MCP response")
+                except json.JSONDecodeError as error:
+                    raise CollectorError(
+                        "hlx_mcp_invalid_json",
+                        "hlx MCP returned malformed JSON",
+                        scope={"tool": tool},
+                    ) from error
+                if response.get("id") == request_id:
+                    return response
+
+        try:
+            initialize = request(
+                "initialize",
+                {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "xharness-runtime-failure-observer",
+                        "version": COLLECTOR_VERSION,
+                    },
+                },
+            )
+            if "error" in initialize:
+                raise CollectorError(
+                    "hlx_mcp_failed",
+                    "hlx MCP initialization failed",
+                    scope={"tool": tool, "error": initialize["error"]},
+                )
+            send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            response = request(
+                "tools/call",
+                {"name": tool, "arguments": arguments},
+            )
+            if "error" in response:
+                raise CollectorError(
+                    "hlx_mcp_failed",
+                    "hlx MCP tool call failed",
+                    scope={"tool": tool, "error": response["error"]},
+                )
+            result = _require_dict(response.get("result"), "hlx MCP result")
+            return result
+        finally:
+            process.stdin.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            process.stdout.close()
+            reader.join(timeout=5)
+            stderr.close()
+
+    def _collect_selected_builds(
+        self,
+        selected_builds: list[dict[str, Any]],
+    ) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.manifest_dir.mkdir(parents=True, exist_ok=True)
+
+        for build in selected_builds:
+            build_id = build["id"]
+            manifest_path = self.manifest_dir / f"{build_id}.json"
+            # Fetch successful submission logs explicitly during traversal. Caching
+            # every AzDO log makes the prescribed 12-build snapshot exceed the
+            # SQLite serialization limit despite those unrelated logs never being used.
+            arguments = [
+                "collect",
+                "azdo-build",
+                str(build_id),
+                "--cache-dir",
+                str(self.cache_dir),
+                "--manifest",
+                str(manifest_path),
+                "--log-scope",
+                "none",
+                "--test-scope",
+                "none",
+                "--helix-scope",
+                "none",
+                "--json",
+            ]
+            if manifest_path.is_file():
+                arguments.append("--resume")
+            result = self._execute(
+                [str(self.executable), *arguments],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self._environment(),
+            )
+            if not manifest_path.is_file():
+                raise CollectorError(
+                    "hlx_manifest_missing",
+                    "hlx collection did not write its declared manifest",
+                    scope={"buildId": build_id, "path": str(manifest_path)},
+                )
+            try:
+                hlx_manifest = json.loads(manifest_path.read_text())
+            except json.JSONDecodeError as error:
+                raise CollectorError(
+                    "hlx_manifest_invalid",
+                    "hlx collection manifest is malformed",
+                    scope={"buildId": build_id, "path": str(manifest_path)},
+                ) from error
+            self.collection_records.append(
+                {
+                    "buildId": build_id,
+                    "role": build["role"],
+                    "manifest": str(manifest_path.relative_to(self.output_dir)),
+                    "exitCode": result.returncode,
+                    "complete": hlx_manifest.get("complete") is True,
+                    "incompleteDetails": hlx_manifest.get("incompleteDetails", []),
+                }
+            )
+            if result.returncode not in {0, 2}:
+                raise CollectorError(
+                    "hlx_collection_failed",
+                    result.stderr.strip()
+                    or f"hlx collection failed for build {build_id}",
+                    scope={
+                        "buildId": build_id,
+                        "arguments": arguments,
+                        "exitCode": result.returncode,
+                        "incompleteDetails": hlx_manifest.get(
+                            "incompleteDetails", []
+                        ),
+                    },
+                )
+        self.cache_status = self._verify_cache_root()
+
+    def _verify_cache_root(self) -> dict[str, Any]:
+        # hlx v0.11.0 exposes cache status only as text, so parse its declared
+        # directory and verify the public partition used by these builds.
+        output = self._run_text(
+            ["cache", "status"],
+            operation="cache-status",
+        )
+        match = re.search(r"^\s*Cache dir:\s*(.+?)\s*$", output, re.MULTILINE)
+        if match is None:
+            raise CollectorError(
+                "hlx_cache_status_invalid",
+                "hlx cache status did not report its effective cache directory",
+                scope={"output": output.strip()},
+            )
+        reported = Path(match.group(1)).resolve()
+        expected = (self.cache_dir / "public").resolve()
+        if reported != expected:
+            raise CollectorError(
+                "hlx_cache_root_mismatch",
+                "ordinary hlx commands and collection do not share the expected cache",
+                scope={
+                    "expected": str(expected),
+                    "reported": str(reported),
+                    "xdgCacheHome": str(self.cache_home),
+                    "collectorCacheDir": str(self.cache_dir),
+                },
+            )
+        return {
+            "verified": True,
+            "xdgCacheHome": str(self.cache_home.relative_to(self.output_dir)),
+            "collectorCacheDir": str(self.cache_dir.relative_to(self.output_dir)),
+            "effectiveCacheDir": str(reported.relative_to(self.output_dir)),
+            "output": output.strip(),
+        }
+
+    def list_builds(self, definition_id: int, limit: int) -> EvidenceValue:
+        payload = self._run_json(
+            [
+                "azdo",
+                "builds",
+                "--org",
+                "dnceng-public",
+                "--project",
+                "public",
+                "--definition-id",
+                str(definition_id),
+                "--branch",
+                "refs/heads/main",
+                "--status",
+                "completed",
+                "--top",
+                str(HLX_BUILD_QUERY_LIMIT),
+                "--query-order",
+                "finishTimeDescending",
+                "--max-time",
+                _utc_text(self.as_of),
+                "--json",
+            ],
+            operation="azdo-builds",
+        )
+        builds = _extract_builds(payload)
+        for item in builds:
+            result = _field(item, "result")
+            if not isinstance(result, str) or result.casefold() not in {
+                "succeeded", "failed", "partiallysucceeded", "canceled"
+            }:
+                raise CollectorError(
+                    "invalid_evidence",
+                    "completed build has no recognized result",
+                    scope={"definitionId": definition_id, "buildId": _field(item, "id")},
+                )
+        matching = [
+            item
+            for item in builds
+            if isinstance(_field(item, "result"), str)
+            and _field(item, "result").casefold()
+            in {"failed", "partiallysucceeded"}
+        ]
+        complete = len(matching) >= limit or len(builds) < HLX_BUILD_QUERY_LIMIT
+        return EvidenceValue(
+            {"count": min(len(matching), limit), "value": matching[:limit]},
+            {
+                "kind": "hlx-azdo-builds",
+                "definitionId": definition_id,
+                "queryTop": HLX_BUILD_QUERY_LIMIT,
+                "returnedBuildCount": len(builds),
+                "locallyMatchedResultCount": len(matching),
+                "returnedFailedBuildCount": min(len(matching), limit),
+                "resultFilter": ["failed", "partiallySucceeded"],
+                "resultFilterAppliedBy": "observer",
+                "queryOrder": "finishTimeDescending",
+                "continuationSupported": False,
+                "bounded": len(builds) == HLX_BUILD_QUERY_LIMIT,
+            },
+            complete=complete,
+        )
+
+    def prepare(self, selected_builds: list[dict[str, Any]]) -> None:
+        if selected_builds:
+            self._collect_selected_builds(selected_builds)
+
+    def timeline(self, build_id: int) -> EvidenceValue:
+        return EvidenceValue(
+            self._run_json(
+                ["azdo", "timeline", str(build_id), "--filter", "all", "--json"],
+                operation="azdo-timeline",
+            ),
+            {
+                "kind": "hlx-azdo-timeline",
+                "buildId": build_id,
+                "source": "live-shared-cache",
+                "complete": True,
+            },
+        )
+
+    def build_log(self, build_id: int, log_id: int) -> TextEvidence:
+        text = self._run_text(
+            ["azdo", "log", str(build_id), str(log_id), "--full"],
+            operation="azdo-log",
+        )
+        return TextEvidence(
+            text,
+            {
+                "kind": "hlx-azdo-log",
+                "buildId": build_id,
+                "logId": log_id,
+                "source": "live-shared-cache",
+            },
+            outcome="empty" if text == "" else "ok",
+        )
+
+    def helix_work_items(self, job_id: str) -> EvidenceValue:
+        payload = _require_dict(
+            self._run_json(
+                ["status", job_id, "all", "--json"],
+                operation="helix-status",
+            ),
+            "hlx Helix status",
+        )
+        failed = _require_list(payload.get("failed"), "failed Helix work items")
+        passed = _require_list(payload.get("passed"), "passed Helix work items")
+        total = payload.get("totalWorkItems")
+        if not isinstance(total, int) or total != len(failed) + len(passed):
+            raise CollectorError(
+                "incomplete_helix_inventory",
+                "live Helix status did not return the declared complete work-item list",
+                scope={
+                    "jobId": job_id,
+                    "totalWorkItems": total,
+                    "returnedWorkItems": len(failed) + len(passed),
+                },
+            )
+        return EvidenceValue(
+            [*failed, *passed],
+            {
+                "kind": "hlx-helix-status",
+                "jobId": job_id,
+                "filter": "all",
+                "source": "live-provider",
+                "complete": True,
+                "totalWorkItems": total,
+                "failedCount": len(failed),
+                "passedCount": len(passed),
+            },
+        )
+
+    def helix_console(self, job_id: str, work_item_name: str) -> TextEvidence:
+        result = self._mcp_call(
+            "helix_logs",
+            {"jobId": job_id, "workItem": work_item_name, "tail": None},
+        )
+        if result.get("isError") is True:
+            structured = result.get("structuredContent")
+            error = (
+                structured.get("error")
+                if isinstance(structured, dict)
+                and isinstance(structured.get("error"), dict)
+                else {}
+            )
+            message = error.get("message")
+            if not isinstance(message, str):
+                content = result.get("content")
+                message = (
+                    content[0].get("text")
+                    if isinstance(content, list)
+                    and content
+                    and isinstance(content[0], dict)
+                    else "hlx console acquisition failed"
+                )
+            if not isinstance(message, str):
+                message = "hlx console acquisition failed without an error message"
+            if error.get("kind") == "not_found" and (
+                error.get("httpStatus") == 404 or "404" in message
+            ):
+                return TextEvidence(
+                    None,
+                    {
+                        "kind": "hlx-console",
+                        "jobId": job_id,
+                        "workItemName": work_item_name,
+                        "source": "live-shared-cache",
+                    },
+                    outcome="console_404",
+                    detail=message,
+                )
+            raise CollectorError(
+                "helix_console_unavailable",
+                message,
+                scope={
+                    "jobId": job_id,
+                    "workItemName": work_item_name,
+                    "providerError": error,
+                },
+            )
+        content = result.get("content")
+        if (
+            not isinstance(content, list)
+            or not content
+            or not isinstance(content[0], dict)
+            or not isinstance(content[0].get("text"), str)
+        ):
+            raise CollectorError(
+                "invalid_evidence",
+                "hlx MCP console response did not contain text",
+                scope={"jobId": job_id, "workItemName": work_item_name},
+            )
+        text = content[0]["text"]
+        return TextEvidence(
+            text,
+            {
+                "kind": "hlx-console",
+                "jobId": job_id,
+                "workItemName": work_item_name,
+                "source": "live-shared-cache",
+                "url": (
+                    "https://helix.dot.net/api/2019-06-17/jobs/"
+                    f"{job_id}/workitems/{urllib.parse.quote(work_item_name, safe='')}/console"
+                ),
+                "urlKind": "canonical-console-reference",
+            },
+            outcome="empty" if text == "" else "ok",
+        )
+
+    def finalize(self, *, complete: bool) -> dict[str, Any]:
+        self.cache_status = self._verify_cache_root()
+        if self.snapshot_dir.exists():
+            raise CollectorError(
+                "hlx_snapshot_exists",
+                "hlx snapshot export destination already exists",
+                scope={"path": str(self.snapshot_dir)},
+            )
+        export = self._execute(
+            [str(self.executable), "snapshot", "export", str(self.snapshot_dir)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._environment(),
+        )
+        if export.returncode:
+            raise CollectorError(
+                "hlx_snapshot_export_failed",
+                export.stderr.strip() or "hlx snapshot export failed",
+                scope={
+                    "path": str(self.snapshot_dir),
+                    "exitCode": export.returncode,
+                },
+            )
+        validation = self._execute(
+            [
+                str(self.executable),
+                "snapshot",
+                "validate",
+                str(self.snapshot_dir),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._environment(),
+        )
+        if validation.returncode:
+            raise CollectorError(
+                "hlx_snapshot_validation_failed",
+                validation.stderr.strip()
+                or validation.stdout.strip()
+                or "hlx snapshot validation failed",
+                scope={
+                    "path": str(self.snapshot_dir),
+                    "exitCode": validation.returncode,
+                },
+            )
+        validation_output = "\n".join(
+            part.strip()
+            for part in (validation.stdout, validation.stderr)
+            if part.strip()
+        )
+        self.snapshot_validation = {
+            "valid": True,
+            "output": validation_output,
+        }
+        return {
+            "layout": "hlx-v0.11.0",
+            "complete": complete,
+            "path": str(self.snapshot_dir.relative_to(self.output_dir)),
+            "cachePath": (
+                str(self.cache_dir.relative_to(self.output_dir))
+                if self.cache_dir.is_dir()
+                else None
+            ),
+            "collections": self.collection_records,
+            "cacheStatus": self.cache_status,
+            "validation": self.snapshot_validation,
+            "reason": None if complete else "observer_collection_incomplete",
+        }
+
+
+def _fixed_time(value: str) -> dt.datetime:
+    parsed = _parse_rfc3339(value, "--now")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Collect deterministic CI evidence for the runtime failure observer"
+    )
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--xharness-repo", required=True, type=Path)
+    parser.add_argument("--hlx", required=True, type=Path)
+    parser.add_argument(
+        "--now",
+        type=_fixed_time,
+        default=None,
+        help="fixed RFC3339 scan time; defaults to current UTC",
+    )
+    return parser
+
+
+def main() -> int:
+    arguments = _parser().parse_args()
+    now = arguments.now or dt.datetime.now(dt.timezone.utc)
+    try:
+        if arguments.output_dir.exists():
+            raise CollectorError(
+                "observer_output_exists",
+                "collector output must be a fresh directory",
+                scope={"path": str(arguments.output_dir)},
+            )
+        source = GitSourcePreparer(arguments.xharness_repo)
+        provider = HlxV011Provider(
+            arguments.hlx,
+            arguments.output_dir,
+            as_of=now,
+        )
+        collector = ObserverCollector(
+            provider=provider,
+            version_resolver=GitHubVersionDetailsResolver(),
+            source_preparer=source,
+            output_dir=arguments.output_dir,
+            now=now,
+        )
+        return collector.run()
+    except CollectorError as error:
+        print(f"runtime-failure-observer-collect: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,71 @@
+{
+  "requests": [
+    {
+      "tool": "search_issues",
+      "arguments": {
+        "owner": "dotnet",
+        "repo": "xharness",
+        "query": "repo:dotnet/xharness is:issue",
+        "page": 1,
+        "perPage": 30
+      },
+      "responses": [
+        {
+          "items": [],
+          "total_count": 0,
+          "incomplete_results": false
+        },
+        {
+          "items": [],
+          "total_count": 0,
+          "incomplete_results": false
+        }
+      ]
+    },
+    {
+      "tool": "search_pull_requests",
+      "arguments": {
+        "owner": "dotnet",
+        "repo": "xharness",
+        "query": "repo:dotnet/xharness is:pr",
+        "page": 1,
+        "perPage": 30
+      },
+      "responses": [
+        {
+          "items": [],
+          "total_count": 0,
+          "incomplete_results": false
+        }
+      ]
+    },
+    {
+      "tool": "search_code",
+      "arguments": {
+        "q": "repo:dotnet/xharness XHarness",
+        "page": 1,
+        "perPage": 30
+      },
+      "responses": [
+        {
+          "items": [],
+          "total_count": 0,
+          "incomplete_results": false
+        }
+      ]
+    },
+    {
+      "tool": "get_commit",
+      "arguments": {
+        "owner": "dotnet",
+        "repo": "xharness",
+        "sha": "4f2266d4c147bd8af3fe4dff129f725ddb9dce57"
+      },
+      "responses": [
+        {
+          "sha": "4f2266d4c147bd8af3fe4dff129f725ddb9dce57"
+        }
+      ]
+    }
+  ]
+}
